@@ -4,14 +4,10 @@ import asyncio
 import time
 import requests
 import shutil
-import nest_asyncio
 from zipfile import ZipFile
 from aiohttp import web
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-
-# Ye lazmi hai Render par async conflicts avoid karne ke liye
-nest_asyncio.apply()
 
 # --- Configuration Variables ---
 PORT = int(os.environ.get("PORT", 8080))
@@ -19,13 +15,13 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN")
 GITHUB_PAT = os.environ.get("GITHUB_PAT", "")
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "")
 REPO_NAME = os.environ.get("REPO_NAME", "HostedBotsData")
-RENDER_URL = os.environ.get("RENDER_URL", "https://your-app-name.onrender.com")
+RENDER_URL = os.environ.get("RENDER_URL", "")
 
 REPO_URL = f"https://{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{REPO_NAME}.git"
 HOSTED_DIR = "hosted_bots"
 RUNNING_BOTS = {}
 
-# Git config
+# GitHub config
 os.system('git config --global user.email "masterbot@example.com"')
 os.system('git config --global user.name "MasterBot Admin"')
 
@@ -45,18 +41,16 @@ async def start_web_server():
 async def keep_alive_ping():
     while True:
         try:
-            if RENDER_URL and RENDER_URL != "https://your-app-name.onrender.com":
+            if RENDER_URL and "http" in RENDER_URL:
                 requests.get(RENDER_URL)
-                print("🔄 Self-ping successful. Render is awake.")
+                print("🔄 Ping successful. Render is awake.")
         except Exception as e:
-            print(f"Ping failed: {e}")
-        await asyncio.sleep(14 * 60) # 14 minutes
+            pass
+        await asyncio.sleep(840) # 14 minutes
 
-# --- 2. GITHUB SYNC & AUTO-STARTUP ---
+# --- 2. GITHUB SYNC ---
 def sync_from_github():
-    if not GITHUB_PAT or not GITHUB_USERNAME:
-        print("⚠️ GitHub credentials missing. Skipping sync.")
-        return
+    if not GITHUB_PAT: return
     if os.path.exists(HOSTED_DIR):
         shutil.rmtree(HOSTED_DIR)
     print("📥 Syncing bots from GitHub...")
@@ -67,10 +61,9 @@ def push_to_github(commit_msg="Added new bot"):
     print("📤 Pushing new data to GitHub...")
     os.system(f"cd {HOSTED_DIR} && git add . && git commit -m '{commit_msg}' && git push")
 
-# --- 3. AUTO-RESTART MONITOR ---
+# --- 3. BOT RUNNER & MONITOR ---
 async def run_and_monitor_bot(bot_name, bot_folder, main_file):
     RUNNING_BOTS[bot_name] = {"active": True, "start_time": time.time(), "status": "Running 🟢"}
-    
     while RUNNING_BOTS.get(bot_name, {}).get("active", False):
         print(f"🚀 Starting {bot_name}...")
         proc = subprocess.Popen(["python", "main.py"], cwd=bot_folder)
@@ -84,16 +77,15 @@ async def run_and_monitor_bot(bot_name, bot_folder, main_file):
             break
             
         RUNNING_BOTS[bot_name]["status"] = "Restarting ⏳"
-        print(f"⚠️ {bot_name} crashed! Restarting in 5 seconds...")
         await asyncio.sleep(5)
 
 # --- 4. TELEGRAM HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🤖 *All-Rounder Master Bot Is Live!*\n\n"
-        "Send me a `.zip` file of your bot to host it.\n\n"
-        "👉 /all - Hosted bots list\n"
-        "👉 /stop <bot_folder> - Stop a bot"
+        "Send me a `.zip` file of your bot to host it permanently.\n\n"
+        "👉 /all - Check hosted bots\n"
+        "👉 /stop <bot_name> - Stop a bot"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -102,7 +94,7 @@ async def receive_bot_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_name = document.file_name
     
     if not file_name.endswith('.zip'):
-        await update.message.reply_text("❌ Sirf .zip file bhejiye!")
+        await update.message.reply_text("❌ Please send a .zip file!")
         return
 
     msg = await update.message.reply_text("⏳ Download & Extracting...")
@@ -120,7 +112,7 @@ async def receive_bot_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     main_file = os.path.join(bot_folder, "main.py")
     if not os.path.exists(main_file):
-        await msg.edit_text("❌ Error: ZIP me `main.py` nahi mili!")
+        await msg.edit_text("❌ Error: `main.py` not found in ZIP!")
         return
 
     req_file = os.path.join(bot_folder, "requirements.txt")
@@ -128,10 +120,7 @@ async def receive_bot_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("⚙️ Installing Dependencies...")
         subprocess.run(["pip", "install", "-r", req_file])
 
-    await msg.edit_text("☁️ Backing up to GitHub...")
     push_to_github(f"Added new bot: {bot_name}")
-
-    await msg.edit_text(f"🚀 Starting {bot_name}...")
     asyncio.create_task(run_and_monitor_bot(bot_name, bot_folder, main_file))
     await msg.edit_text(f"✅ *{bot_name}* Hosted successfully!", parse_mode="Markdown")
 
@@ -157,15 +146,15 @@ async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             RUNNING_BOTS[bot_name]["process"].terminate()
             await update.message.reply_text(f"🛑 {bot_name} stopped.")
         else:
-            await update.message.reply_text("❌ Ye bot exist nahi karta.")
+            await update.message.reply_text("❌ Bot not found.")
     except IndexError:
         await update.message.reply_text("Format: `/stop <bot_name>`")
 
-# --- MAIN STARTUP (FIXED LIFECYCLE) ---
+# --- MASTER LIFECYCLE (ERROR-FREE) ---
 async def main():
     sync_from_github()
     
-    # Auto-start old bots
+    # Auto-start existing bots
     if os.path.exists(HOSTED_DIR):
         for folder in os.listdir(HOSTED_DIR):
             bot_dir = os.path.join(HOSTED_DIR, folder)
@@ -177,33 +166,31 @@ async def main():
                 if os.path.exists(main_file):
                     asyncio.create_task(run_and_monitor_bot(folder, bot_dir, main_file))
 
-    # Bot Setup
+    # Initialize Master Bot
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("all", list_bots))
     app.add_handler(CommandHandler("stop", stop_bot))
     app.add_handler(MessageHandler(filters.Document.ZIP, receive_bot_zip))
 
-    # Correct Sequence
-    print("⏳ Initializing Bot...")
-    await app.initialize()
-    print("✅ Bot Initialized!")
-    
-    await app.start()
-    print("✅ Bot Started!")
-    
-    await app.updater.start_polling()
-    print("✅ Polling Started!")
-
-    # Start Background Tasks
-    asyncio.create_task(start_web_server())
+    # Start Web Server First
+    await start_web_server()
     asyncio.create_task(keep_alive_ping())
 
-    # Keep app running
+    # Start Bot Safely
+    print("⏳ Initializing Bot...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("✅ Bot Started Successfully!")
+
+    # Block forever
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
+    import nest_asyncio
+    nest_asyncio.apply()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot stopped by user.")
+        print("Stopped by User.")
