@@ -2,3 +2,13 @@ python-telegram-bot==20.8
 aiohttp
 nest_asyncio
 requests
+# ──────────────────────────────────────────────────────
+#  Master Hosting Bot v2.0  —  requirements.txt
+#  Python 3.11  |  Render.com Free Tier
+# ──────────────────────────────────────────────────────
+
+# Telegram bot framework — async, PTB 20.x
+python-telegram-bot[job-queue]==20.8
+
+# Async HTTP client + web server (keep-alive ping & port binding)
+aiohttp==3.9.5
