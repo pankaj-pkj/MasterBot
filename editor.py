@@ -761,4 +761,3 @@ function x(s){return es(s);}function I(s){return String(s).replace(/[^a-zA-Z0-9]
 function fi(e){return{py:'🐍',js:'📜',ts:'📜',json:'{}',txt:'📄',md:'📝',sh:'⚙',yml:'⚙',yaml:'⚙',env:'🔑',html:'🌐',css:'🎨',png:'🖼',jpg:'🖼',gif:'🖼',zip:'📦',log:'📋',cfg:'⚙',ini:'⚙',toml:'⚙',sql:'🗄'}[e]||'📄';}
 function gL(n){const e=n.split('.').pop().toLowerCase();return{py:'python',js:'javascript',ts:'typescript',json:'json',html:'html',css:'css',sh:'shell',md:'markdown',yml:'yaml',yaml:'yaml',sql:'sql',txt:'plaintext',toml:'ini',cfg:'ini',ini:'ini'}[e]||'plaintext';}
 </script></body></html>"""
-
