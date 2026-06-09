@@ -1,18 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   MASTER HOSTING BOT  v4.1  —  Multi-Node Edition                   ║
+║   MASTER HOSTING BOT  v4.2  —  Env Isolation + Multi-Node           ║
 ║   python-telegram-bot 20.x  ·  Python 3.11  ·  Render.com           ║
 ║   Codian Studio 💎                                                   ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  v4.1 New:                                                           ║
-║  • STAGGERED STARTUP — bots start 5s apart, not all at once         ║
-║  • MULTI-NODE — register worker Render URLs, split bots across them  ║
-║  • /addnode <url> <secret> — admin adds a worker node               ║
-║  • /nodes — show all nodes + their load                              ║
-║  • /setnode <botname> <node_url> — move a bot to specific node       ║
-║  • Auto load-balancing — new bots go to least-loaded node           ║
-║  • Worker nodes run worker.py (separate file)                        ║
-║  • All v4.0 features retained                                        ║
+║  v4.2 NEW (this file):                                               ║
+║  • ENV ISOLATION — child bots CANNOT steal master BOT_TOKEN         ║
+║    _MASTER_ENV_KEYS stripped before subprocess.Popen()              ║
+║    Child's .env file loaded instead — full isolation                 ║
+║  • Warning sent via Telegram if bot uses os.getenv but has no .env  ║
+║                                                                      ║
+║  v4.1 (retained):                                                    ║
+║  • STAGGERED STARTUP — bots start 5s apart (Render 500MB fix)       ║
+║  • MULTI-NODE — worker Render accounts, auto load-balancing          ║
+║  • /addnode /removenode /nodes commands                              ║
+║                                                                      ║
+║  v4.0 (retained):                                                    ║
+║  • NAME COLLISION FIX — uid_botname prefix (user A & B same name)   ║
+║  • AUTO SELF-HEAL — missing pkg, conflict, port, encoding, flood    ║
+║  • WEB IDE RUN FIX — restart_flag properly handled                  ║
+║  • Smart error parser — exact line + fix hint in Telegram + IDE     ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -743,6 +750,77 @@ def _kill_remove(bot_key:str,deleted_by=0):
 #  STAGGERED via semaphore: only 1 bot starts at a time, 5s apart
 # ══════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  CHILD PROCESS ENVIRONMENT ISOLATION
+#  Strips master's sensitive env vars so child bots cannot steal them.
+#  Loads child's own .env file if present.
+# ══════════════════════════════════════════════════════════════════════
+
+# Master env vars that must NEVER leak into child bot processes
+_MASTER_ENV_KEYS = {
+    "BOT_TOKEN", "GITHUB_PAT", "GITHUB_USERNAME", "REPO_NAME",
+    "NODE_SECRET", "RENDER_URL", "IS_WORKER", "EDITOR_TOKEN",
+    "DATABASE_URL", "SECRET_KEY",
+}
+
+
+def _make_child_env(bot_dir: Path) -> dict:
+    """
+    Build a clean isolated environment for the child bot subprocess.
+
+    1. Copy system env but STRIP all master-sensitive keys.
+    2. Load child's own .env file (if it exists) and inject those vars.
+    3. If child code uses os.getenv("BOT_TOKEN"), it gets ITS OWN value
+       from its .env — not the master bot's token.
+    """
+    # Base: system env minus master secrets
+    env = {k: v for k, v in os.environ.items() if k not in _MASTER_ENV_KEYS}
+
+    # Load child's .env file
+    env_file = bot_dir / ".env"
+    if env_file.exists():
+        try:
+            for raw_line in env_file.read_text(errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key:
+                    env[key] = val
+            log.debug("Loaded .env for %s", bot_dir.name)
+        except Exception as e:
+            log.warning("Failed reading .env for %s: %s", bot_dir.name, e)
+
+    # Safety: ensure PATH is always present
+    if "PATH" not in env:
+        env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+    return env
+
+
+def _check_needs_env(code: str) -> list[str]:
+    """
+    Detect env vars a bot reads via os.getenv() / os.environ[].
+    Returns list of var names found. Used to warn user if .env missing.
+    """
+    found = set()
+    # Match: os.getenv("KEY") or os.getenv('KEY')
+    for m in re.finditer(r'os\.getenv\(\s*["\']([^"\']+)["\']', code):
+        found.add(m.group(1))
+    # Match: os.environ.get("KEY")
+    for m in re.finditer(r'os\.environ\.get\(\s*["\']([^"\']+)["\']', code):
+        found.add(m.group(1))
+    # Match: os.environ["KEY"]
+    for m in re.finditer(r'os\.environ\[["\']([^"\']+)["\']', code):
+        found.add(m.group(1))
+    # Match: environ["KEY"]
+    for m in re.finditer(r'environ\[["\']([^"\']+)["\']', code):
+        found.add(m.group(1))
+    return sorted(found)
+
 _startup_lock = asyncio.Semaphore(1)   # ensures sequential startup
 
 async def run_bot(bot_key: str, bot_dir: Path, owner_id: int, stagger: bool = False):
@@ -781,8 +859,10 @@ async def _run_bot_inner(bot_key: str, bot_dir: Path, owner_id: int):
             lf=open(log_path,"a",encoding="utf-8",errors="replace")
             lf.write(f"\n{'─'*55}\n[START] {display_name(bot_key)}  ·  {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'─'*55}\n")
             lf.flush()
+            child_env = _make_child_env(bot_dir)
             proc=subprocess.Popen([sys.executable,"main.py"],
-                                  cwd=str(bot_dir),stdout=lf,stderr=lf)
+                                  cwd=str(bot_dir),stdout=lf,stderr=lf,
+                                  env=child_env)
         except Exception as exc:
             if lf:
                 try: lf.close()
@@ -948,6 +1028,21 @@ async def _finalize(bot_key:str, bot_dir:Path, uid:int, msg, code_text=""):
         if installed: log.info("Auto-installed: %s",installed)
 
     if bot_key in RUNNING_BOTS: _do_stop(bot_key); await asyncio.sleep(2)
+
+    # ── Env var check: warn if bot uses os.getenv but has no .env ─────
+    code_to_check = code_text or ((bot_dir/"main.py").read_text(errors="replace") if (bot_dir/"main.py").exists() else "")
+    needed_vars   = _check_needs_env(code_to_check)
+    env_file_exists = (bot_dir/".env").exists()
+    if needed_vars and not env_file_exists:
+        env_warn = (
+            f"⚠️ *{display_name(bot_key)}* reads these env vars:\n"
+            + "\n".join(f"  • `{v}`" for v in needed_vars[:10])
+            + "\n\n"
+            "🔧 *Add a `.env` file* to your bot folder with these values.\n"
+            "Example `BOT_TOKEN=your_token_here`\n\n"
+            "_Without `.env`, bot cannot read its own config._"
+        )
+        await _notify(owner_id, env_warn)
 
     # ── Load balancing: try to use a worker node ──────────────────────
     best_node = await pick_best_node()
