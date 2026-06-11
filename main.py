@@ -1,14 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   MASTER HOSTING BOT  v4.2  —  Env Isolation + Multi-Node           ║
+║   MASTER HOSTING BOT  v4.3  —  Auto-Failover + Speed Boost          ║
 ║   python-telegram-bot 20.x  ·  Python 3.11  ·  Render.com           ║
 ║   Codian Studio 💎                                                   ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  v4.2 NEW (this file):                                               ║
-║  • ENV ISOLATION — child bots CANNOT steal master BOT_TOKEN         ║
-║    _MASTER_ENV_KEYS stripped before subprocess.Popen()              ║
-║    Child's .env file loaded instead — full isolation                 ║
-║  • Warning sent via Telegram if bot uses os.getenv but has no .env  ║
+║  v4.3 NEW (this file):                                               ║
+║  • AUTO-FAILOVER — if a node goes down, its bots auto-restart on    ║
+║    another available node or locally (no manual intervention)        ║
+║  • SPEED BOOST — concurrent_updates, tuned timeouts, fast polling   ║
+║  • /migratenodes — manually move all bots to best available nodes   ║
+║  v4.2 (retained):                                                    ║
+║  • ENV ISOLATION — child bots cannot steal master BOT_TOKEN         ║
 ║                                                                      ║
 ║  v4.1 (retained):                                                    ║
 ║  • STAGGERED STARTUP — bots start 5s apart (Render 500MB fix)       ║
@@ -652,6 +654,116 @@ async def keep_alive_loop():
                     log.info("Ping → %d", r.status)
             except Exception as e: log.warning("Ping: %s", e)
             await asyncio.sleep(840)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  AUTO-FAILOVER SYSTEM
+#  Monitors all worker nodes every 60s.
+#  3 consecutive failures → auto-migrate bots to another node/local.
+# ══════════════════════════════════════════════════════════════════════
+
+_node_fail_count: dict[str, int] = {}
+_FAILOVER_THRESHOLD = 3
+
+
+async def auto_migrate_from_node(failed_url: str):
+    """Move bots from a failed node to best available node or local."""
+    reg  = load_registry()
+    bots = [(k, v) for k, v in reg.items() if v.get("node") == failed_url]
+    if not bots:
+        return
+    log.warning("AUTO-FAILOVER: %s down — migrating %d bots", failed_url, len(bots))
+    for bot_key, v in bots:
+        bot_dir  = HOSTED_DIR / bot_key
+        owner_id = v.get("owner_id", 0)
+        if not bot_dir.exists() or not (bot_dir / "main.py").exists():
+            continue
+        statuses = await all_node_statuses()
+        live = [s for s in statuses
+                if s["online"] and s["url"] != failed_url and s["enabled"]]
+        if live:
+            best = min(live, key=lambda s: s["bot_count"])
+            ok   = await deploy_to_node(best["url"], bot_key, bot_dir, owner_id)
+            if ok:
+                reg[bot_key]["node"] = best["url"]; save_registry(reg)
+                log.info("  FAILOVER %s → %s", bot_key, best["url"])
+                await _notify(owner_id,
+                    f"⚠️ *Auto-Failover*\n\nNode `{failed_url.split('//')[-1][:25]}` went down.\n"
+                    f"🔄 *{display_name(bot_key)}* moved to `{best['url'].split('//')[-1][:25]}`\n\n"
+                    f"_Bot continues running automatically._")
+                continue
+        # No live node → run locally
+        if bot_key not in RUNNING_BOTS or not RUNNING_BOTS[bot_key].get("active"):
+            reg[bot_key]["node"] = "local"; save_registry(reg)
+            asyncio.create_task(run_bot(bot_key, bot_dir, owner_id, stagger=False))
+            log.info("  FAILOVER %s → local", bot_key)
+            await _notify(owner_id,
+                f"⚠️ *Auto-Failover*\n\nNode went down.\n"
+                f"🔄 *{display_name(bot_key)}* moved to *local server*.\n\n"
+                f"_Bot continues running automatically._")
+    for aid in ADMIN_IDS:
+        try:
+            await _APP.bot.send_message(aid,
+                f"🚨 *Node Failover*\n\n🔴 `{failed_url}`\n"
+                f"📦 {len(bots)} bots migrated\n/nodes to see status.",
+                parse_mode="Markdown")
+        except Exception: pass
+
+
+async def node_health_monitor():
+    """Background: ping nodes every 60s, trigger failover on 3rd failure."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            nodes = load_nodes()
+            for url, v in nodes.items():
+                if not v.get("enabled", True): continue
+                status = await get_node_status(url, v["secret"])
+                if status.get("online"):
+                    _node_fail_count[url] = 0
+                else:
+                    _node_fail_count[url] = _node_fail_count.get(url, 0) + 1
+                    cnt = _node_fail_count[url]
+                    log.warning("Node %s fail %d/%d", url, cnt, _FAILOVER_THRESHOLD)
+                    if cnt >= _FAILOVER_THRESHOLD:
+                        _node_fail_count[url] = 0
+                        asyncio.create_task(auto_migrate_from_node(url))
+        except Exception as e:
+            log.warning("Health monitor error: %s", e)
+        await asyncio.sleep(60)
+
+
+async def cmd_migratenodes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /migratenodes — rebalance all bots across worker nodes."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    sm        = await update.message.reply_text("🔄 Checking nodes…")
+    statuses  = await all_node_statuses()
+    live      = [s for s in statuses if s["online"] and s["enabled"]]
+    reg       = load_registry()
+    moved = failed = 0
+    if not live:
+        await sm.edit_text("❌ No live worker nodes. All bots stay local."); return
+    local_bots = [(k, v) for k, v in reg.items() if v.get("node", "local") == "local"]
+    for bot_key, v in local_bots:
+        bot_dir  = HOSTED_DIR / bot_key
+        owner_id = v.get("owner_id", 0)
+        if not bot_dir.exists() or not (bot_dir / "main.py").exists(): continue
+        best = min(live, key=lambda s: s["bot_count"])
+        if best["bot_count"] >= len(RUNNING_BOTS): continue
+        ok = await deploy_to_node(best["url"], bot_key, bot_dir, owner_id)
+        if ok:
+            reg[bot_key]["node"] = best["url"]; best["bot_count"] += 1
+            _do_stop(bot_key); moved += 1
+        else:
+            failed += 1
+    save_registry(reg); push_to_github("migratenodes rebalance")
+    lines2 = [f"✅ *Migration done!*\n\n📦 Moved: `{moved}`  ❌ Failed: `{failed}`\n"]
+    for s in live:
+        lines2.append(f"🌐 `{s['url'].split('//')[-1][:28]}` → `{s['bot_count']}` bots")
+    await sm.edit_text("\n".join(lines2), parse_mode="Markdown")
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1565,7 +1677,7 @@ async def autostart():
 async def main():
     global _APP
     log.info("════════════════════════════════════════════════════")
-    log.info("   Master Hosting Bot v4.1  —  Multi-Node Edition  ")
+    log.info("   Master Hosting Bot v4.3  —  Auto-Failover + Speed  ")
     log.info("   Codian Studio 💎   IS_WORKER=%s", IS_WORKER)
     log.info("════════════════════════════════════════════════════")
 
@@ -1576,7 +1688,21 @@ async def main():
 
     web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS)
 
-    _APP = ApplicationBuilder().token(BOT_TOKEN).build()
+    _APP = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        # ── Speed & concurrency ───────────────────────────────────────
+        .concurrent_updates(True)          # handle multiple updates in parallel
+        .read_timeout(10)                  # faster timeout (default 5)
+        .write_timeout(10)
+        .connect_timeout(10)
+        .pool_timeout(5)
+        .get_updates_read_timeout(42)      # long-poll: keep connection open
+        .get_updates_write_timeout(15)
+        .get_updates_connect_timeout(15)
+        .get_updates_pool_timeout(5)
+        .build()
+    )
 
     handlers = [
         CommandHandler("start",       cmd_start),
@@ -1597,6 +1723,7 @@ async def main():
         CommandHandler("unban",       cmd_unban),
         # Node management (admin only)
         CommandHandler("nodes",       cmd_nodes),
+        CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
         CommandHandler("removenode",  cmd_removenode),
         MessageHandler(filters.Document.ALL,            handle_upload),
@@ -1611,6 +1738,7 @@ async def main():
 
     await start_web_server()
     asyncio.create_task(keep_alive_loop())
+    asyncio.create_task(node_health_monitor())   # auto-failover
     await autostart()   # staggered!
 
     log.info("Clearing webhook…")
@@ -1618,7 +1746,11 @@ async def main():
     await _APP.initialize()
     await _APP.start()
     await _APP.updater.start_polling(
-        drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=0.0,          # check for updates as fast as possible
+        timeout=30,                 # long-poll timeout
+    )
 
     try:
         await _APP.bot.set_my_commands([
@@ -1634,13 +1766,14 @@ async def main():
             BotCommand("all",         "👑 All bots"),
             BotCommand("users",       "👑 All users"),
             BotCommand("nodes",       "👑 Worker nodes"),
+            BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
             BotCommand("msg",         "👑 Broadcast"),
             BotCommand("pr",          "👑 Set slots"),
         ])
     except Exception: pass
 
-    log.info("✅ v4.1 live! Stagger=%ds  IDE: %s/editor", STARTUP_DELAY_SEC, RENDER_URL or "localhost:"+str(PORT))
+    log.info("✅ v4.3 live! Stagger=%ds  IDE: %s/editor", STARTUP_DELAY_SEC, RENDER_URL or "localhost:"+str(PORT))
     await asyncio.Event().wait()
 
 
