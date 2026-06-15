@@ -1,13 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   MASTER HOSTING BOT  —  Web IDE  v5.0                              ║
-║   editor.py  ·  Codian Studio 💎                                    ║
+║   MASTER HOSTING BOT  —  Web IDE  v6.0  (Replit Exact)             ║
+║   Codian Studio 💎                                                  ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  Security: per-user tokens, ownership check on EVERY API call        ║
-║  NO device notifications, NO session alerts                          ║
-║  VS Code Dark theme, Replit layout                                   ║
-║  Mobile zoom fully fixed (3 independent methods)                     ║
-║  Run button: stop → wait → restart (never freezes)                  ║
+║  Layout (exactly like Replit screenshot):                           ║
+║  • Top bar: logo + file tabs (like Replit)                          ║
+║  • Left: narrow activity bar + collapsible file tree               ║
+║  • Center: Monaco editor                                            ║
+║  • Bottom panel: Output / Problems / Terminal TABS                  ║
+║  • Status bar at very bottom                                        ║
+║                                                                     ║
+║  Security: per-user tokens, ownership check on every API call       ║
+║  Mobile zoom: 3-method fix (gesture + doubletap + ctrlwheel)       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 import os, json, time, uuid, shutil, asyncio, logging, mimetypes
@@ -38,11 +42,11 @@ def init_editor(running_bots, app_ref=None, admin_ids=None):
 
 
 # ── Token / Auth ──────────────────────────────────────────────────────
-def _lj(p: Path, d):
+def _lj(p, d):
     try:    return json.loads(p.read_text())
     except: return d
 
-def _sj(p: Path, data):
+def _sj(p, data):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2))
 
@@ -78,27 +82,28 @@ def _block_ip(ip):
 
 # ── Helpers ───────────────────────────────────────────────────────────
 def _fup(s):
-    s=int(max(0,s)); h,r=divmod(s,3600); m,sc=divmod(r,60); return f"{h}h {m}m {sc}s"
+    s=int(max(0,s)); h,r=divmod(s,3600); m,sc=divmod(r,60)
+    return f"{h}h {m}m {sc}s"
 
 def _reg():
     try:    return json.loads((DATA_DIR/"registry.json").read_text())
     except: return {}
 
-def _display(k):
-    parts=k.split("_",1)
-    if len(parts)==2 and parts[0].isdigit(): return parts[1]
+def _disp(k):
+    p=k.split("_",1)
+    if len(p)==2 and p[0].isdigit(): return p[1]
     return k
 
 def _can(uid, ia, bot):
     if ia: return True
-    reg=_reg()
-    if str(reg.get(bot,{}).get("owner_id",""))==str(uid): return True
+    r=_reg()
+    if str(r.get(bot,{}).get("owner_id",""))==str(uid): return True
     if str(_RUNNING_BOTS.get(bot,{}).get("owner_id",""))==str(uid): return True
     return False
 
 def _ubots(uid, ia):
-    reg=_reg(); seen=set(); bots=[]
-    src=list(reg.keys()) if ia else [k for k,v in reg.items() if str(v.get("owner_id",""))==str(uid)]
+    r=_reg(); seen=set(); bots=[]
+    src=list(r.keys()) if ia else [k for k,v in r.items() if str(v.get("owner_id",""))==str(uid)]
     for k in src: bots.append(k); seen.add(k)
     for n,e in _RUNNING_BOTS.items():
         if n not in seen and (ia or str(e.get("owner_id",""))==str(uid)): bots.append(n)
@@ -119,7 +124,8 @@ def _tree(root, rel=""):
         if e.name.startswith(".") or e.name=="__pycache__": continue
         n={"name":e.name,"path":(rel+"/"+e.name).lstrip("/"),
            "type":"dir" if e.is_dir() else "file",
-           "ext":e.suffix.lstrip(".").lower() if e.is_file() else "","size":e.stat().st_size if e.is_file() else 0}
+           "ext":e.suffix.lstrip(".").lower() if e.is_file() else "",
+           "size":e.stat().st_size if e.is_file() else 0}
         if e.is_dir(): n["children"]=_tree(e,n["path"])
         items.append(n)
     return items
@@ -130,16 +136,16 @@ def _bots(uid, ia):
     for item in sorted(HOSTED_DIR.iterdir()):
         if not item.is_dir() or item.name in BLOCKED_NAMES or item.name not in allowed: continue
         seen.add(item.name); e=_RUNNING_BOTS.get(item.name,{})
-        bots.append({"name":item.name,"display":_display(item.name),"path":item.name,"type":"bot",
-                     "status":e.get("status","Offline 🔴"),"restarts":e.get("restarts",0),
-                     "heals":e.get("heal_tries",0),
+        bots.append({"name":item.name,"display":_disp(item.name),"path":item.name,
+                     "type":"bot","status":e.get("status","Offline 🔴"),
+                     "restarts":e.get("restarts",0),"heals":e.get("heal_tries",0),
                      "uptime":_fup(time.time()-e["start_time"]) if e.get("start_time") else "—",
                      "has_files":(item/"main.py").exists(),"children":_tree(item,item.name)})
     for n in allowed:
         if n in seen: continue
         e=_RUNNING_BOTS.get(n,{})
         if e.get("active"):
-            bots.append({"name":n,"display":_display(n),"path":n,"type":"bot",
+            bots.append({"name":n,"display":_disp(n),"path":n,"type":"bot",
                          "status":e.get("status","Running 🟢"),"restarts":e.get("restarts",0),
                          "heals":e.get("heal_tries",0),
                          "uptime":_fup(time.time()-e["start_time"]) if e.get("start_time") else "—",
@@ -164,7 +170,8 @@ async def api_read(req):
     raw=req.rel_url.query.get("path",""); bot=raw.split("/")[0]
     if not _can(uid,ia,bot): return web.json_response({"error":"forbidden"},status=403)
     path=_sp(raw)
-    if not path or not path.exists() or not path.is_file(): return web.json_response({"error":"Not found"},status=404)
+    if not path or not path.exists() or not path.is_file():
+        return web.json_response({"error":"Not found"},status=404)
     try: content=path.read_text(errors="replace")[:524288]
     except Exception as ex: return web.json_response({"error":str(ex)},status=500)
     return web.json_response({"path":raw,"name":path.name,"content":content,
@@ -232,18 +239,27 @@ async def api_newbot(req):
     uid,ia=_auth(req)
     if not uid: return web.json_response({"error":"unauthorized"},status=401)
     try:
-        import re
+        import re as _re
         body=await req.json(); raw=body.get("name","").strip().replace(" ","_").replace("/","")
         if not raw: return web.json_response({"error":"Name required"},status=400)
-        clean=re.sub(r"[^a-zA-Z0-9_-]","_",raw)[:40]
+        clean=_re.sub(r"[^a-zA-Z0-9_-]","_",raw)[:40]
         bot_key=f"{uid}_{clean}"; bot_dir=HOSTED_DIR/bot_key
         if bot_dir.exists(): return web.json_response({"error":f"'{clean}' exists"},status=409)
         bot_dir.mkdir(parents=True)
-        (bot_dir/"main.py").write_text(f'# {clean}\nprint("Hello from {clean}!")\n',encoding="utf-8")
-        (bot_dir/"requirements.txt").write_text("# Dependencies\n",encoding="utf-8")
+        (bot_dir/"main.py").write_text(
+            f'# {clean}  —  Codian Studio 💎\n'
+            '# Put your BOT_TOKEN in .env file (never hardcode)\n\n'
+            'import os\nfrom dotenv import load_dotenv\nload_dotenv()\n\n'
+            'BOT_TOKEN = os.getenv("BOT_TOKEN")\n'
+            'if not BOT_TOKEN:\n'
+            '    raise ValueError("BOT_TOKEN not set in .env!")\n\n'
+            f'print("Starting {clean}...")\n', encoding="utf-8")
+        (bot_dir/"requirements.txt").write_text("python-dotenv\n", encoding="utf-8")
+        (bot_dir/".env").write_text(
+            "# Fill in your values\nBOT_TOKEN=your_token_here\n", encoding="utf-8")
         try:
-            reg=_reg(); reg[bot_key]={"owner_id":uid,"registered_at":time.time(),"display_name":clean}
-            (DATA_DIR/"registry.json").write_text(json.dumps(reg,indent=2))
+            r=_reg(); r[bot_key]={"owner_id":uid,"registered_at":time.time(),"display_name":clean}
+            (DATA_DIR/"registry.json").write_text(json.dumps(r,indent=2))
         except: pass
         return web.json_response({"ok":True,"name":bot_key,"display":clean,"main":f"{bot_key}/main.py"})
     except Exception as ex: return web.json_response({"error":str(ex)},status=500)
@@ -256,7 +272,8 @@ async def api_run(req):
         if not bot: return web.json_response({"error":"bot required"},status=400)
         if not _can(uid,ia,bot): return web.json_response({"error":"forbidden"},status=403)
         bot_dir=HOSTED_DIR/bot
-        if not (bot_dir/"main.py").exists(): return web.json_response({"error":"main.py not found"},status=404)
+        if not (bot_dir/"main.py").exists():
+            return web.json_response({"error":"main.py not found"},status=404)
         e=_RUNNING_BOTS.get(bot)
         if e:
             e["active"]=False; p=e.get("process")
@@ -283,8 +300,7 @@ async def api_logs(req):
     lines=_tail(lp,n).splitlines() if _tail(lp,n) else []
     e=_RUNNING_BOTS.get(bot,{})
     return web.json_response({"bot":bot,"lines":lines,"status":e.get("status","Offline"),
-                              "uptime":_fup(time.time()-e["start_time"]) if e.get("start_time") else "—",
-                              "restarts":e.get("restarts",0)})
+                              "uptime":_fup(time.time()-e["start_time"]) if e.get("start_time") else "—"})
 
 async def ws_logs(req):
     tok=req.rel_url.query.get("token",""); bot=req.rel_url.query.get("bot","")
@@ -339,240 +355,482 @@ def register_routes(app):
     app.router.add_post("/editor/api/run",    api_run)
     app.router.add_get("/editor/api/logs",    api_logs)
     app.router.add_get("/editor/ws",          ws_logs)
-    log.info("Web IDE routes ready at /editor")
+    log.info("Web IDE v6.0 ready at /editor")
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  LOGIN PAGE
+# ══════════════════════════════════════════════════════════════════════
 _LOGIN = """<!DOCTYPE html><html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Codian Studio</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}html{-webkit-text-size-adjust:100%}
-body{background:#1e1e1e;color:#d4d4d4;font-family:'Segoe UI',sans-serif;display:flex;
-     align-items:center;justify-content:center;height:100svh;padding:20px}
-.c{background:#252526;border:1px solid #3c3c3c;border-radius:6px;padding:34px 26px;
-   width:100%;max-width:340px;text-align:center}
-.l{font-size:2.5rem;margin-bottom:10px}h1{color:#4fc3f7;font-size:.98rem;margin-bottom:4px}
-p{color:#858585;font-size:.8rem;margin-bottom:22px}
-input{width:100%;background:#3c3c3c;border:1px solid #555;border-radius:4px;
-      padding:10px 12px;color:#d4d4d4;font-size:15px;outline:none;margin-bottom:12px;
-      font-family:monospace;-webkit-appearance:none}
-input:focus{border-color:#0e639c}
-button{width:100%;background:#0e639c;border:none;border-radius:4px;padding:10px;
-       color:#fff;font-size:14px;font-weight:600;cursor:pointer;touch-action:manipulation}
-button:hover{background:#1177bb}
-.h{color:#858585;font-size:.74rem;margin-top:12px}code{background:#3c3c3c;padding:2px 5px;border-radius:3px;color:#9cdcfe}
-</style></head><body><div class="c"><div class="l">💎</div><h1>Codian Studio IDE</h1>
-<p>Master Hosting Bot — Web Editor</p>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{background:#0e1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;
+     display:flex;align-items:center;justify-content:center;height:100svh;padding:20px}
+.c{background:#161b22;border:1px solid #30363d;border-radius:12px;
+   padding:36px 28px;width:100%;max-width:360px;text-align:center;box-shadow:0 16px 48px #0005}
+.logo{font-size:2.8rem;margin-bottom:10px}
+h1{color:#58a6ff;font-size:1.05rem;font-weight:700;margin-bottom:4px}
+p{color:#8b949e;font-size:.82rem;margin-bottom:24px}
+input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+      padding:11px 14px;color:#e6edf3;font-size:15px;outline:none;margin-bottom:14px;
+      font-family:monospace;letter-spacing:1px;-webkit-appearance:none}
+input:focus{border-color:#58a6ff;box-shadow:0 0 0 3px #58a6ff22}
+button{width:100%;background:#238636;border:none;border-radius:6px;padding:12px;
+       color:#fff;font-size:14px;font-weight:700;cursor:pointer;touch-action:manipulation}
+button:hover{background:#2ea043}
+.hint{color:#8b949e;font-size:.75rem;margin-top:14px;line-height:1.6}
+code{background:#30363d;padding:2px 6px;border-radius:4px;color:#79c0ff}
+</style></head><body>
+<div class="c"><div class="logo">💎</div><h1>Codian Studio IDE</h1>
+<p>Master Hosting Bot</p>
 <input type="password" id="t" placeholder="Paste your access token"
        autocomplete="off" autocorrect="off" autocapitalize="off"
        onkeydown="if(event.key==='Enter')go()">
 <button onclick="go()">Sign In →</button>
-<p class="h">Get token from bot: <code>/ide</code></p></div>
+<p class="hint">Get token from bot: <code>/ide</code></p></div>
 <script>function go(){var t=document.getElementById('t').value.trim();
 if(!t)return;window.location.href='/editor?token='+encodeURIComponent(t);}
 </script></body></html>"""
 
 
-_IDE = r"""<!DOCTYPE html><html lang="en"><head>
+# ══════════════════════════════════════════════════════════════════════
+#  IDE — Replit-exact layout  v6.0
+# ══════════════════════════════════════════════════════════════════════
+_IDE = r"""<!DOCTYPE html>
+<html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover">
-<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>Codian Studio 💎</title>
 <style>
-html{touch-action:none;-webkit-text-size-adjust:100%;text-size-adjust:100%;overflow:hidden;height:100%}
+/* ── ZOOM KILL ── */
+html{touch-action:none;-webkit-text-size-adjust:100%;overflow:hidden;height:100%}
 body{height:100svh;overflow:hidden;touch-action:none}
 *{-webkit-tap-highlight-color:transparent;touch-action:manipulation;box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#1e1e1e;--bg1:#252526;--bg2:#2d2d2d;--bg3:#3c3c3c;--bdr:#3c3c3c;
-      --bl:#0e639c;--bl2:#4fc3f7;--gr:#4ec9b0;--gr2:#89d185;--rd:#f44747;
-      --yl:#dcdcaa;--pu:#c586c0;--tx:#d4d4d4;--tx2:#858585;--tx3:#555;
-      --aw:46px;--sw:220px;--bh:22px;--th:35px;--ph:200px;--sh:22px}
-#root{display:flex;flex-direction:column;height:100svh;background:var(--bg);color:var(--tx);
-      font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;-webkit-font-smoothing:antialiased}
-#mb{height:var(--bh);background:#323233;border-bottom:1px solid #111;display:flex;
-    align-items:center;padding:0 10px;gap:8px;flex-shrink:0;user-select:none}
-.ml{font-weight:800;color:var(--bl2);font-size:.85rem;margin-right:6px}
-.mi{font-size:12px;color:var(--tx2);padding:2px 7px;border-radius:3px;cursor:pointer;touch-action:manipulation;white-space:nowrap}
-.mi:hover{background:var(--bg3);color:var(--tx)}
-.ms{width:1px;height:14px;background:var(--bdr)}.msp{flex:1}
-#mb-b{font-size:11px;color:var(--pu);font-weight:600;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#mid{display:flex;flex:1;overflow:hidden;min-height:0}
-#act{width:var(--aw);flex-shrink:0;background:#333;border-right:1px solid #111;
-     display:flex;flex-direction:column;align-items:center;padding:4px 0;gap:2px}
-.ab{width:38px;height:38px;border-radius:6px;display:flex;align-items:center;justify-content:center;
-    cursor:pointer;font-size:18px;color:var(--tx3);border:1px solid transparent;
-    touch-action:manipulation;transition:.1s;position:relative}
-.ab:hover{color:var(--tx);background:#3d3d3d}
-.ab.on{color:var(--tx);border-color:var(--bl)}
-.ab.on::before{content:'';position:absolute;left:-1px;top:8px;bottom:8px;width:2px;background:var(--bl2);border-radius:0 2px 2px 0}
-.abs{flex:1}
-#sb{width:var(--sw);min-width:120px;max-width:480px;flex-shrink:0;display:flex;flex-direction:column;
-    background:var(--bg1);border-right:1px solid #111;overflow:hidden}
-#sb.hide{display:none}
-.ss{height:22px;display:flex;align-items:center;padding:0 10px;font-size:11px;font-weight:700;
-    text-transform:uppercase;letter-spacing:.6px;color:var(--tx2);flex-shrink:0;user-select:none}
-.ss .sa{display:flex;gap:2px;margin-left:auto}
-.ib{background:none;border:none;color:var(--tx2);cursor:pointer;padding:2px 4px;border-radius:3px;
-    font-size:13px;line-height:1;touch-action:manipulation}
-.ib:hover{background:var(--bg3);color:var(--tx)}
-#tr{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;scrollbar-color:#555 transparent;touch-action:pan-y}
-#tr::-webkit-scrollbar{width:4px}#tr::-webkit-scrollbar-thumb{background:#555}
-#rs{width:4px;flex-shrink:0;cursor:col-resize;background:transparent;transition:background .12s}
-#rs.on,#rs:hover{background:var(--bl)}
-#ea{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0;min-height:0}
-#et{height:var(--th);flex-shrink:0;background:var(--bg1);border-bottom:1px solid #111;
-    display:flex;overflow-x:auto;overflow-y:hidden;touch-action:pan-x}
-#et::-webkit-scrollbar{height:2px}#et::-webkit-scrollbar-thumb{background:var(--bdr)}
-.tab{display:inline-flex;align-items:center;gap:5px;padding:0 12px;height:100%;flex-shrink:0;
-     cursor:pointer;font-size:12.5px;color:var(--tx2);border-right:1px solid #111;
-     white-space:nowrap;touch-action:manipulation}
-.tab:hover{color:var(--tx);background:#2a2a2a}
-.tab.act{background:var(--bg);color:var(--tx);border-top:1px solid var(--bl)}
-.tab.dirty .tn::after{content:'●';color:var(--yl);margin-left:4px;font-size:9px}
-.tx{opacity:0;font-size:12px;border-radius:3px;padding:1px 3px;line-height:1;touch-action:manipulation;transition:.1s}
-.tab:hover .tx{opacity:.5}.tx:hover{opacity:1!important;background:var(--rd);color:#fff}
-#ew{flex:1;position:relative;overflow:hidden;min-height:0;background:#1e1e1e;touch-action:none}
+
+/* ── THEME (GitHub Dark + Replit accent) ── */
+:root{
+  --bg:    #0d1117;  --bg1: #161b22;  --bg2: #21262d;  --bg3: #30363d;
+  --bdr:   #30363d;
+  --blue:  #58a6ff;  --blue2:#1f6feb; --green:#3fb950;  --green2:#56d364;
+  --red:   #f85149;  --yel:  #d29922; --pur:  #bc8cff;  --orange:#ffa657;
+  --tx:    #e6edf3;  --tx2:  #8b949e; --tx3:  #484f58;
+  --act:   46px;     --sb:   240px;   --top:  44px;     --panel:200px; --stat:22px;
+}
+#root{display:flex;flex-direction:column;height:100svh;background:var(--bg);
+      color:var(--tx);font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;
+      -webkit-font-smoothing:antialiased}
+
+/* ══ TOP BAR (Replit style) ══ */
+#topbar{
+  height:var(--top);flex-shrink:0;
+  background:var(--bg1);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;padding:0 0 0 0;
+  user-select:none;overflow:hidden;
+}
+/* Left section of topbar */
+#tb-left{display:flex;align-items:center;gap:0;height:100%;flex-shrink:0}
+.tb-logo{display:flex;align-items:center;gap:8px;padding:0 14px;height:100%;
+         border-right:1px solid var(--bdr);font-weight:800;color:var(--blue);font-size:.9rem}
+/* File tabs (Replit style — in topbar) */
+#file-tabs{display:flex;align-items:stretch;height:100%;overflow-x:auto;flex:1;min-width:0}
+#file-tabs::-webkit-scrollbar{height:2px}
+#file-tabs::-webkit-scrollbar-thumb{background:var(--bdr)}
+.ftab{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:0 14px;height:100%;flex-shrink:0;
+  cursor:pointer;font-size:12.5px;color:var(--tx2);
+  border-right:1px solid var(--bdr);white-space:nowrap;
+  position:relative;touch-action:manipulation;
+  transition:background .1s,color .1s;
+}
+.ftab:hover{background:var(--bg2);color:var(--tx)}
+.ftab.act{background:var(--bg);color:var(--tx)}
+/* Active tab indicator — line at bottom like Replit */
+.ftab.act::after{content:'';position:absolute;bottom:0;left:0;right:0;
+                  height:2px;background:var(--blue)}
+.ftab.dirty .ftn::after{content:'●';color:var(--yel);margin-left:4px;font-size:9px}
+.ftab-x{opacity:0;font-size:12px;border-radius:3px;padding:0 2px;
+         line-height:1.3;touch-action:manipulation;transition:opacity .1s}
+.ftab:hover .ftab-x{opacity:.5}
+.ftab-x:hover{opacity:1!important;background:var(--red)!important;color:#fff!important}
+/* Right section of topbar */
+#tb-right{display:flex;align-items:center;gap:4px;padding:0 10px;flex-shrink:0;
+           border-left:1px solid var(--bdr);height:100%}
+.tbtn{display:inline-flex;align-items:center;gap:4px;border-radius:6px;
+      padding:5px 10px;cursor:pointer;font-size:12px;border:1px solid var(--bdr);
+      color:var(--tx2);background:var(--bg2);white-space:nowrap;
+      touch-action:manipulation;transition:.12s;user-select:none}
+.tbtn:hover{border-color:var(--blue);color:var(--tx)}
+.tbtn.run{border-color:var(--green);color:var(--green);background:#0d2014}
+.tbtn.run:hover,.tbtn.run.busy{background:var(--green);color:#fff;pointer-events:none}
+.tbtn.on{border-color:var(--blue);color:var(--blue)}
+#bot-lbl{font-size:12px;color:var(--pur);font-weight:700;max-width:100px;
+         overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ══ WORKSPACE ══ */
+#workspace{display:flex;flex:1;overflow:hidden;min-height:0}
+
+/* ══ ACTIVITY BAR (Replit left strip) ══ */
+#actbar{
+  width:var(--act);flex-shrink:0;
+  background:var(--bg1);border-right:1px solid var(--bdr);
+  display:flex;flex-direction:column;align-items:center;padding:6px 0;gap:2px;
+}
+.ab{width:34px;height:34px;border-radius:6px;display:flex;align-items:center;
+    justify-content:center;cursor:pointer;font-size:17px;color:var(--tx3);
+    border:1px solid transparent;touch-action:manipulation;transition:.1s;position:relative}
+.ab:hover{color:var(--tx);background:var(--bg2)}
+.ab.on{color:var(--blue);border-color:var(--blue2);background:var(--bg2)}
+.ab.on::before{content:'';position:absolute;left:-1px;top:6px;bottom:6px;
+               width:2px;background:var(--blue);border-radius:0 2px 2px 0}
+.ab-sp{flex:1}
+
+/* ══ SIDEBAR (file tree) ══ */
+#sidebar{
+  width:var(--sb);min-width:150px;max-width:400px;flex-shrink:0;
+  display:flex;flex-direction:column;
+  background:var(--bg1);border-right:1px solid var(--bdr);overflow:hidden;
+}
+#sidebar.hide{display:none}
+.sb-head{height:36px;display:flex;align-items:center;padding:0 12px;
+         border-bottom:1px solid var(--bdr);flex-shrink:0;user-select:none}
+.sb-title{flex:1;font-size:11px;font-weight:700;text-transform:uppercase;
+          letter-spacing:.6px;color:var(--tx2)}
+.sb-acts{display:flex;gap:2px}
+.ib{background:none;border:none;color:var(--tx2);cursor:pointer;
+    padding:3px 5px;border-radius:4px;font-size:13px;line-height:1;touch-action:manipulation}
+.ib:hover{background:var(--bg2);color:var(--tx)}
+#tree{flex:1;overflow-y:auto;overflow-x:hidden;
+      scrollbar-width:thin;scrollbar-color:var(--bdr) transparent;touch-action:pan-y}
+#tree::-webkit-scrollbar{width:4px}
+#tree::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px}
+
+/* Sidebar resize handle */
+#rsb{width:4px;flex-shrink:0;cursor:col-resize;background:transparent;transition:background .12s}
+#rsb.on,#rsb:hover{background:var(--blue)}
+
+/* ══ EDITOR PANE ══ */
+#ed-pane{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0;min-height:0}
+
+/* Monaco editor wrapper — ZOOM FIX: touch-action:none */
+#ed-wrap{flex:1;position:relative;overflow:hidden;min-height:0;
+         background:#0d1117;touch-action:none}
 #mc{position:absolute;inset:0;touch-action:none;overflow:hidden}
-#wlc{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
-     justify-content:center;color:var(--tx3);gap:14px;background:#1e1e1e}
-#wlc.hide{display:none}
-#wlc .wi{font-size:3.5rem}#wlc h2{font-size:1rem;color:var(--tx2);font-weight:400}
-#wlc kbd{background:var(--bg3);border:1px solid #555;border-radius:3px;
-         padding:1px 6px;font-family:monospace;font-size:11px;color:var(--tx)}
-#rp{height:4px;flex-shrink:0;cursor:row-resize;background:var(--bdr);transition:background .12s;touch-action:none}
-#rp.on,#rp:hover{background:var(--bl)}
-#pn{height:var(--ph);min-height:60px;max-height:65vh;flex-shrink:0;display:flex;flex-direction:column;background:var(--bg1);border-top:1px solid #111}
-#pn.hide{height:0!important;min-height:0;border-top:none;overflow:hidden}
-#pt{height:35px;flex-shrink:0;background:var(--bg2);border-bottom:1px solid #111;display:flex;align-items:center;padding:0 6px;gap:0}
-.ptb{height:100%;display:inline-flex;align-items:center;padding:0 14px;font-size:12px;color:var(--tx2);cursor:pointer;border-bottom:1px solid transparent;touch-action:manipulation}
-.ptb:hover{color:var(--tx)}.ptb.act{color:var(--tx);border-bottom-color:var(--bl2)}
-.pts{flex:1}.pbb{padding:2px 6px;font-size:12px;color:var(--tx2);cursor:pointer;border-radius:3px;touch-action:manipulation}
-.pbb:hover{background:var(--bg3);color:var(--tx)}
-#pb{flex:1;position:relative;overflow:hidden}
-.pv{position:absolute;inset:0;overflow-y:auto;padding:5px 10px;
-    font-family:'Cascadia Code','Fira Code',Consolas,monospace;font-size:12px;line-height:1.7;
-    color:#d4d4d4;scrollbar-width:thin;scrollbar-color:#555 transparent;touch-action:pan-y;display:none}
-.pv.act{display:block}.pv::-webkit-scrollbar{width:4px}.pv::-webkit-scrollbar-thumb{background:#555}
+
+/* Welcome screen */
+#welcome{position:absolute;inset:0;display:flex;flex-direction:column;
+         align-items:center;justify-content:center;color:var(--tx3);gap:12px;
+         background:#0d1117}
+#welcome.hide{display:none}
+#welcome .wi{font-size:3rem}
+#welcome h2{font-size:1rem;color:var(--tx2);font-weight:400}
+#welcome p{font-size:12px}
+#welcome kbd{background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+             padding:1px 6px;font-family:monospace;font-size:11px;color:var(--tx)}
+
+/* Panel resize handle */
+#rpanel{height:5px;flex-shrink:0;cursor:row-resize;background:var(--bdr);
+        transition:background .12s;touch-action:none}
+#rpanel.on,#rpanel:hover{background:var(--blue)}
+
+/* ══ BOTTOM PANEL (Output/Problems/Terminal tabs — like Replit) ══ */
+#panel{
+  height:var(--panel);min-height:80px;max-height:60vh;flex-shrink:0;
+  display:flex;flex-direction:column;
+  background:var(--bg1);border-top:1px solid var(--bdr);
+}
+#panel.hide{height:0!important;min-height:0;border-top:none;overflow:hidden}
+
+/* Panel tab strip */
+#panel-tabstrip{
+  height:36px;flex-shrink:0;
+  background:var(--bg2);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;padding:0 8px;gap:0;
+}
+.ptab{
+  height:100%;display:inline-flex;align-items:center;gap:5px;
+  padding:0 14px;font-size:12px;color:var(--tx2);cursor:pointer;
+  border-bottom:2px solid transparent;white-space:nowrap;touch-action:manipulation;
+  transition:color .1s;position:relative;
+}
+.ptab:hover{color:var(--tx)}
+.ptab.act{color:var(--tx);border-bottom-color:var(--blue)}
+/* Dot indicator for problems */
+.ptab .dot{width:6px;height:6px;border-radius:50%;background:var(--red);
+            display:none;flex-shrink:0}
+.ptab .dot.show{display:block}
+.pt-sp{flex:1}
+.pt-btn{padding:3px 7px;font-size:12px;color:var(--tx2);cursor:pointer;
+        border-radius:4px;touch-action:manipulation}
+.pt-btn:hover{background:var(--bg3);color:var(--tx)}
+
+/* Panel content views */
+#panel-body{flex:1;position:relative;overflow:hidden}
+.pview{
+  position:absolute;inset:0;overflow-y:auto;
+  padding:5px 12px;
+  font-family:'Cascadia Code','Fira Code',Consolas,monospace;
+  font-size:12px;line-height:1.7;color:#e6edf3;
+  scrollbar-width:thin;scrollbar-color:var(--bdr) transparent;
+  touch-action:pan-y;display:none;
+}
+.pview.act{display:block}
+.pview::-webkit-scrollbar{width:4px}
+.pview::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:2px}
+
+/* Log line colors */
 .ll{white-space:pre-wrap;word-break:break-all}
-.le{color:#f44747}.lw{color:#dcdcaa}.lo{color:#4ec9b0}.li{color:#4fc3f7}.ls{color:#555}
-.pi{display:flex;align-items:flex-start;gap:8px;padding:4px 6px;border-radius:3px;margin-bottom:2px;font-size:12px}
-.pi:hover{background:var(--bg3)}.pico{flex-shrink:0;font-size:13px}
-.plc{color:var(--tx2);font-size:11px;margin-top:1px}
-.ph{margin-top:4px;padding:6px 8px;background:#2d2d2d;border-left:2px solid var(--bl);
-    border-radius:0 3px 3px 0;font-size:11px;color:#9cdcfe}
-#pc{display:inline-block;background:var(--bg3);border-radius:10px;padding:1px 6px;font-size:10px;color:var(--tx2);margin-left:4px}
-#sbar{height:var(--sh);flex-shrink:0;background:var(--bl);display:flex;align-items:center;
-      padding:0 10px;gap:12px;font-size:11.5px;color:#fff;user-select:none}
-#sb-b{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#sb-l{opacity:.8;font-family:monospace}#sb-s{opacity:.85}
-.ec{background:#f44747;color:#fff;padding:0 6px;border-radius:10px;font-size:10px;font-weight:700;display:none}
-.bi{padding:1px 0}
-.bh{display:flex;align-items:center;gap:4px;padding:4px 10px;cursor:pointer;border-left:2px solid transparent;font-size:13px;touch-action:manipulation}
-.bh:hover{background:#2a2a2a}.bh.sel{background:#094771;border-left-color:var(--bl2)}
-.car{font-size:9px;color:var(--tx3);flex-shrink:0;width:10px;display:inline-block;transition:transform .15s}
-.car.op{transform:rotate(90deg)}
-.bn{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bst{font-size:9px;padding:1px 5px;border-radius:10px;flex-shrink:0;white-space:nowrap}
-.br{background:#143014;color:#4ec9b0}.bs{background:#3a1414;color:#f44747}.bo{background:#333;color:var(--tx2)}
-.bc{display:none;padding-left:10px}.bc.op{display:block}
-.fi{display:flex;align-items:center;gap:5px;padding:2px 8px;cursor:pointer;font-size:12.5px;touch-action:manipulation}
-.fi:hover{background:#2a2a2a}.fi.sel{background:#094771}
-.dc{display:none;padding-left:12px}.dc.op{display:block}
-.fic{font-size:12px;flex-shrink:0;width:15px}.fn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.fd{color:#dcdcaa}
-.mov{display:none;position:fixed;inset:0;background:#000000cc;align-items:center;
-     justify-content:center;z-index:300;padding:16px;touch-action:none}
+.le{color:#f85149}.lw{color:#d29922}.lo{color:#3fb950}.li{color:#58a6ff}.ls{color:#484f58}
+
+/* Problems view items */
+.prob{display:flex;align-items:flex-start;gap:8px;padding:5px 6px;
+      border-radius:5px;margin-bottom:3px;cursor:pointer}
+.prob:hover{background:var(--bg2)}
+.prob-ico{flex-shrink:0;font-size:14px;margin-top:1px}
+.prob-body{flex:1}
+.prob-msg{font-size:12.5px;font-family:'Segoe UI',sans-serif}
+.prob-loc{font-size:11px;color:var(--tx2);margin-top:1px;font-family:monospace}
+.prob-hint{margin-top:5px;padding:6px 10px;background:var(--bg);border-left:2px solid var(--blue2);
+           border-radius:0 5px 5px 0;font-size:11px;color:#79c0ff;font-family:'Segoe UI',sans-serif}
+
+/* Terminal placeholder */
+#pv-term{color:var(--tx2);font-family:'Segoe UI',sans-serif}
+.term-cmd{font-family:monospace;color:var(--green2)}
+
+/* ══ STATUS BAR (Replit bottom bar) ══ */
+#statusbar{
+  height:var(--stat);flex-shrink:0;
+  background:var(--blue2);
+  display:flex;align-items:center;padding:0 12px;gap:14px;
+  font-size:11.5px;color:#fff;user-select:none;
+}
+#sb-bot{font-weight:700;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#sb-st{opacity:.85}
+#sb-ln{font-family:monospace;opacity:.8}
+.err-badge{background:#f85149;color:#fff;padding:0 7px;border-radius:10px;
+           font-size:10px;font-weight:700;display:none}
+
+/* ══ TREE NODES (exactly like Replit file tree) ══ */
+.bot-item{padding:1px 0}
+.bot-row{display:flex;align-items:center;gap:4px;padding:5px 12px;cursor:pointer;
+         border-left:2px solid transparent;touch-action:manipulation;user-select:none}
+.bot-row:hover{background:var(--bg2)}
+.bot-row.sel{background:#1f3557;border-left-color:var(--blue)}
+.caret{font-size:9px;color:var(--tx3);flex-shrink:0;width:10px;
+       transition:transform .15s;display:inline-block}
+.caret.op{transform:rotate(90deg)}
+.bname{flex:1;font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bst{font-size:9px;padding:1px 6px;border-radius:8px;flex-shrink:0;white-space:nowrap;font-weight:600}
+.bst-r{background:#0d2014;color:var(--green)}.bst-s{background:#250d0d;color:var(--red)}
+.bst-o{background:var(--bg2);color:var(--tx2)}
+.bot-children{display:none;padding-left:12px}.bot-children.op{display:block}
+.frow{display:flex;align-items:center;gap:5px;padding:2px 12px;cursor:pointer;
+      touch-action:manipulation;user-select:none}
+.frow:hover{background:var(--bg2)}.frow.sel{background:#1f3557}
+.dch{display:none;padding-left:14px}.dch.op{display:block}
+.fic{font-size:12px;flex-shrink:0;width:16px}
+.fname{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fname-dir{color:#d29922}
+
+/* ══ MODALS ══ */
+.mov{display:none;position:fixed;inset:0;background:#000000cc;
+     align-items:center;justify-content:center;z-index:300;padding:16px;touch-action:none}
 .mov.show{display:flex}
-.modal{background:#252526;border:1px solid #555;border-radius:6px;padding:20px;width:100%;max-width:380px}
-.modal h3{margin-bottom:14px;color:var(--bl2);font-size:.95rem;font-weight:600}
-.modal input{width:100%;background:#3c3c3c;border:1px solid #555;border-radius:4px;padding:9px 11px;
-             color:var(--tx);font-size:14px;outline:none;margin-bottom:11px;-webkit-appearance:none}
-.modal input:focus{border-color:var(--bl)}
-.mbt{display:flex;gap:8px;justify-content:flex-end}
-.mok{padding:7px 16px;border-radius:4px;border:none;background:var(--bl);color:#fff;cursor:pointer;font-size:13px;touch-action:manipulation}
-.mok:hover{background:#1177bb}
-.mc2{padding:7px 16px;border-radius:4px;border:1px solid #555;background:var(--bg3);color:var(--tx);cursor:pointer;font-size:13px;touch-action:manipulation}
-#toast{position:fixed;bottom:30px;right:16px;background:#252526;border-radius:4px;
-       padding:9px 14px;font-size:12.5px;opacity:0;pointer-events:none;z-index:500;
-       max-width:260px;border:1px solid var(--bdr);transition:opacity .18s}
+.modal{background:var(--bg1);border:1px solid var(--bdr);border-radius:10px;
+       padding:22px;width:100%;max-width:380px;box-shadow:0 12px 40px #0008}
+.modal h3{margin-bottom:14px;color:var(--blue);font-size:.95rem;font-weight:700}
+.modal input{width:100%;background:var(--bg);border:1px solid var(--bdr);border-radius:6px;
+             padding:9px 12px;color:var(--tx);font-size:14px;outline:none;
+             margin-bottom:12px;-webkit-appearance:none}
+.modal input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #58a6ff22}
+.mbtns{display:flex;gap:8px;justify-content:flex-end}
+.mok{padding:8px 16px;border-radius:6px;border:none;background:var(--blue2);
+     color:#fff;cursor:pointer;font-size:13px;font-weight:600;touch-action:manipulation}
+.mok:hover{background:#388bfd}
+.mcancel{padding:8px 16px;border-radius:6px;border:1px solid var(--bdr);
+         background:var(--bg2);color:var(--tx);cursor:pointer;font-size:13px;touch-action:manipulation}
+
+/* ══ TOAST ══ */
+#toast{position:fixed;bottom:28px;right:16px;background:var(--bg1);border-radius:8px;
+       padding:10px 16px;font-size:12.5px;opacity:0;pointer-events:none;z-index:500;
+       max-width:280px;border:1px solid var(--bdr);transition:opacity .2s}
 #toast.show{opacity:1}
-#toast.ok{border-color:var(--gr);color:var(--gr2)}#toast.err{border-color:var(--rd);color:var(--rd)}#toast.info{border-color:var(--bl);color:var(--bl2)}
-#dov{display:none;position:fixed;inset:0;background:#0e639c22;border:2px dashed var(--bl);z-index:400;
-     align-items:center;justify-content:center;font-size:1.2rem;color:var(--bl2);pointer-events:none}
-#dov.show{display:flex}#finp{display:none}
-@media(max-width:600px){:root{--sw:190px;--aw:42px;--ph:160px}.mi{display:none}}
+#toast.ok{border-color:var(--green);color:var(--green2)}
+#toast.err{border-color:var(--red);color:var(--red)}
+#toast.info{border-color:var(--blue2);color:var(--blue)}
+
+/* Drop overlay */
+#dov{display:none;position:fixed;inset:0;background:#58a6ff15;border:2px dashed var(--blue);
+     z-index:400;align-items:center;justify-content:center;font-size:1.3rem;
+     color:var(--blue);pointer-events:none}
+#dov.show{display:flex}
+#finp{display:none}
+
+@media(max-width:600px){
+  :root{--sb:200px;--act:40px;--panel:160px}
+  .tbtn span{display:none}
+}
 </style></head><body>
 <input type="file" id="finp" multiple>
-<div id="dov">📁 Drop to upload</div><div id="toast"></div>
-<div class="mov" id="m-nb"><div class="modal"><h3>🤖 New Bot</h3>
-  <input id="nb-n" placeholder="bot-name" autocorrect="off" autocapitalize="off">
-  <div class="mbt"><button class="mc2" onclick="cM('m-nb')">Cancel</button><button class="mok" onclick="doNB()">Create</button></div></div></div>
+<div id="dov">📁 Drop files to upload</div>
+<div id="toast"></div>
+
+<!-- Modals -->
+<div class="mov" id="m-nb"><div class="modal"><h3>🤖 New Bot Project</h3>
+  <input id="nb-n" placeholder="project-name" autocorrect="off" autocapitalize="off">
+  <div class="mbtns"><button class="mcancel" onclick="cM('m-nb')">Cancel</button>
+    <button class="mok" onclick="doNB()">Create</button></div></div></div>
 <div class="mov" id="m-nf"><div class="modal"><h3>📄 New File</h3>
   <input id="nf-n" placeholder="filename.py" autocorrect="off" autocapitalize="off">
-  <div class="mbt"><button class="mc2" onclick="cM('m-nf')">Cancel</button><button class="mok" onclick="doNF()">Create</button></div></div></div>
+  <div class="mbtns"><button class="mcancel" onclick="cM('m-nf')">Cancel</button>
+    <button class="mok" onclick="doNF()">Create</button></div></div></div>
 <div class="mov" id="m-nd"><div class="modal"><h3>📁 New Folder</h3>
   <input id="nd-n" placeholder="folder-name" autocorrect="off" autocapitalize="off">
-  <div class="mbt"><button class="mc2" onclick="cM('m-nd')">Cancel</button><button class="mok" onclick="doND()">Create</button></div></div></div>
-<div class="mov" id="m-ul"><div class="modal"><h3>⬆️ Upload</h3>
-  <p style="color:var(--tx2);font-size:12px;margin-bottom:12px">To: <b id="ul-d">/</b></p>
-  <button class="mok" style="width:100%;margin-bottom:10px" onclick="document.getElementById('finp').click()">Choose Files…</button>
-  <div style="border:1px dashed #555;border-radius:4px;padding:14px;text-align:center;color:var(--tx3);font-size:12px">or drag & drop files anywhere</div>
-  <div class="mbt" style="margin-top:12px"><button class="mc2" onclick="cM('m-ul')">Close</button></div></div></div>
+  <div class="mbtns"><button class="mcancel" onclick="cM('m-nd')">Cancel</button>
+    <button class="mok" onclick="doND()">Create</button></div></div></div>
+<div class="mov" id="m-ul"><div class="modal"><h3>⬆️ Upload Files</h3>
+  <p style="color:var(--tx2);font-size:12px;margin-bottom:12px">To: <b id="ul-d" style="color:var(--tx)">/</b></p>
+  <button class="mok" style="width:100%;margin-bottom:10px"
+    onclick="document.getElementById('finp').click()">📂 Choose Files</button>
+  <div style="border:1px dashed var(--bdr);border-radius:6px;padding:14px;
+       text-align:center;color:var(--tx3);font-size:12px">or drag & drop anywhere</div>
+  <div class="mbtns" style="margin-top:12px"><button class="mcancel" onclick="cM('m-ul')">Close</button>
+  </div></div></div>
+
+<!-- ════ APP ════ -->
 <div id="root">
-<div id="mb"><span class="ml">💎</span><div class="ms"></div>
-  <span class="mi" onclick="oM('m-nb')">＋ Bot</span>
-  <span class="mi" id="mb-nf" style="display:none" onclick="oM('m-nf')">New File</span>
-  <span class="mi" onclick="showUL()">Upload</span>
-  <span class="mi" onclick="save()">Save</span>
-  <span class="mi" onclick="run()">▶ Run</span>
-  <div class="msp"></div><span class="mi" id="mb-b">No bot</span></div>
-<div id="mid">
-<div id="act">
-  <div class="ab on" id="ab-e" onclick="tSB(true)" title="Explorer [B]">📁</div>
-  <div class="ab" onclick="toast('Search — coming soon','info')">🔍</div>
-  <div class="abs"></div>
-  <div class="ab" onclick="run()" title="Run [Ctrl+Enter]">▶</div>
-  <div class="ab" onclick="showUL()" title="Upload">⬆</div>
-</div>
-<div id="sb">
-  <div class="ss">Explorer<div class="sa">
-    <button class="ib" onclick="rf()" title="Refresh">⟳</button>
-    <button class="ib" onclick="oM('m-nb')" title="New Bot">＋</button>
-    <button class="ib" id="sb-nf" style="display:none" onclick="oM('m-nf')">📄</button>
-    <button class="ib" id="sb-nd" style="display:none" onclick="oM('m-nd')">📁</button>
-  </div></div>
-  <div id="tr"><div style="padding:20px;text-align:center;color:var(--tx3);font-size:12px">Loading…</div></div>
-</div>
-<div id="rs"></div>
-<div id="ea">
-  <div id="et"><div class="tab act" id="tw">Welcome</div></div>
-  <div id="ew"><div id="mc"></div>
-    <div id="wlc"><div class="wi">💎</div><h2>Codian Studio</h2>
-      <p style="font-size:12px;margin-top:6px">Select a file from Explorer</p>
-      <p style="font-size:11px;margin-top:8px"><kbd>B</kbd> sidebar &nbsp;<kbd>T</kbd> panel &nbsp;<kbd>Ctrl+S</kbd> save &nbsp;<kbd>Ctrl+Enter</kbd> run</p>
+
+  <!-- TOP BAR (Replit style: logo | file tabs | right buttons) -->
+  <div id="topbar">
+    <div id="tb-left">
+      <div class="tb-logo">💎 <span style="font-size:.8rem;font-weight:600">Codian</span></div>
+    </div>
+    <!-- File tabs live here, between logo and right buttons -->
+    <div id="file-tabs">
+      <div class="ftab act" id="ft-welcome" style="color:var(--tx2)">
+        <span>Welcome</span>
+      </div>
+    </div>
+    <div id="tb-right">
+      <span id="bot-lbl">No bot</span>
+      <button class="tbtn" onclick="showUL()" title="Upload">⬆</button>
+      <button class="tbtn" onclick="save()" title="Save [Ctrl+S]">💾 <span>Save</span></button>
+      <button class="tbtn run" id="btn-run" onclick="run()">▶ <span>Run</span></button>
+      <button class="tbtn on" id="btn-sb" onclick="tSB()" title="Files [B]">☰</button>
+      <button class="tbtn on" id="btn-panel" onclick="tPanel()" title="Console [T]">⬛</button>
     </div>
   </div>
-  <div id="rp"></div>
-  <div id="pn">
-    <div id="pt">
-      <div class="ptb act" id="pt-o" onclick="sP('o')">Output</div>
-      <div class="ptb" id="pt-p" onclick="sP('p')">Problems<span id="pc">0</span></div>
-      <div class="ptb" id="pt-t" onclick="sP('t')">Terminal</div>
-      <div class="pts"></div>
-      <span class="pbb" onclick="clrP()">✕</span>
-      <span class="pbb" onclick="pBot()">⬇</span>
-      <span class="pbb" onclick="tP()">⊟</span>
+
+  <!-- WORKSPACE -->
+  <div id="workspace">
+
+    <!-- ACTIVITY BAR -->
+    <div id="actbar">
+      <div class="ab on" id="ab-e" onclick="tSB(true)" title="Explorer [B]">📁</div>
+      <div class="ab" onclick="toast('Search — coming soon','info')" title="Search">🔍</div>
+      <div class="ab-sp"></div>
+      <div class="ab" onclick="run()" title="Run [Ctrl+Enter]">▶</div>
+      <div class="ab" onclick="showUL()" title="Upload">⬆</div>
+      <div class="ab" id="ab-nb" onclick="oM('m-nb')" title="New Bot">＋</div>
     </div>
-    <div id="pb">
-      <div class="pv act" id="pv-o"></div>
-      <div class="pv" id="pv-p"><div style="padding:10px;color:var(--tx2);font-size:12px">No problems. Run your bot to check.</div></div>
-      <div class="pv" id="pv-t"><div style="padding:10px;color:var(--tx2);font-size:12px">Shell — coming soon.</div></div>
+
+    <!-- SIDEBAR (file tree) -->
+    <div id="sidebar">
+      <div class="sb-head">
+        <span class="sb-title">Explorer</span>
+        <div class="sb-acts">
+          <button class="ib" onclick="rf()" title="Refresh">⟳</button>
+          <button class="ib" id="sb-nf" style="display:none" onclick="oM('m-nf')" title="New File">📄</button>
+          <button class="ib" id="sb-nd" style="display:none" onclick="oM('m-nd')" title="New Folder">📁</button>
+        </div>
+      </div>
+      <div id="tree">
+        <div style="padding:18px;text-align:center;color:var(--tx3);font-size:12px">Loading…</div>
+      </div>
+    </div>
+    <div id="rsb"></div>
+
+    <!-- EDITOR PANE -->
+    <div id="ed-pane">
+
+      <!-- Monaco editor -->
+      <div id="ed-wrap">
+        <div id="mc"></div>
+        <div id="welcome">
+          <div class="wi">💎</div>
+          <h2>Codian Studio</h2>
+          <p style="margin-top:6px">Select a file to start editing</p>
+          <p style="margin-top:8px;font-size:11px">
+            <kbd>B</kbd> sidebar &nbsp;
+            <kbd>T</kbd> console &nbsp;
+            <kbd>Ctrl+S</kbd> save &nbsp;
+            <kbd>Ctrl+Enter</kbd> run</p>
+        </div>
+      </div>
+
+      <!-- Panel resize -->
+      <div id="rpanel"></div>
+
+      <!-- BOTTOM PANEL — tabs like Replit -->
+      <div id="panel">
+        <div id="panel-tabstrip">
+          <div class="ptab act" id="pt-out" onclick="showP('out')">
+            Output
+          </div>
+          <div class="ptab" id="pt-prob" onclick="showP('prob')">
+            Problems <div class="dot" id="prob-dot"></div>
+          </div>
+          <div class="ptab" id="pt-term" onclick="showP('term')">
+            Terminal
+          </div>
+          <div class="pt-sp"></div>
+          <span class="pt-btn" onclick="clrPanel()">✕ Clear</span>
+          <span class="pt-btn" onclick="panelBot()">⬇</span>
+          <span class="pt-btn" onclick="tPanel()">⊟</span>
+        </div>
+        <div id="panel-body">
+          <div class="pview act" id="pv-out"></div>
+          <div class="pview" id="pv-prob">
+            <div style="padding:10px 0;color:var(--tx2);font-size:12px">
+              No problems detected. Run your bot to check for errors.
+            </div>
+          </div>
+          <div class="pview" id="pv-term">
+            <div style="padding:12px 0">
+              <p style="color:var(--tx2);font-size:12px;margin-bottom:10px">
+                Interactive shell — coming soon. Use <b>Output</b> tab for bot logs.
+              </p>
+              <p class="term-cmd" style="font-size:12px">$ python main.py</p>
+              <p style="color:var(--tx3);font-size:11px;margin-top:4px">
+                ↑ Running via ▶ Run button
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
-</div></div>
-<div id="sbar"><span class="ec" id="ec">0</span><span id="sb-b">💎 Codian Studio</span><span id="sb-s">Ready</span><span id="sb-l">Ln 1, Col 1</span></div>
+
+  <!-- STATUS BAR (Replit bottom bar) -->
+  <div id="statusbar">
+    <span class="err-badge" id="err-badge">0</span>
+    <span id="sb-bot">💎 Codian Studio</span>
+    <span id="sb-st">Ready</span>
+    <span id="sb-ln">Ln 1, Col 1</span>
+  </div>
 </div>
+
+<!-- Monaco from CDN -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.46.0/min/vs/loader.min.js"></script>
 <script>
 'use strict';
-// ANTI-ZOOM
+
+// ── ZOOM KILL (3 independent methods) ────────────────────────────────
 document.addEventListener('gesturestart', e=>e.preventDefault(),{passive:false});
 document.addEventListener('gesturechange',e=>e.preventDefault(),{passive:false});
 document.addEventListener('gestureend',  e=>e.preventDefault(),{passive:false});
@@ -580,184 +838,505 @@ let _lt=0;
 document.addEventListener('touchend',e=>{const n=Date.now();if(n-_lt<280)e.preventDefault();_lt=n;},{passive:false});
 document.addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey)e.preventDefault();},{passive:false});
 document.addEventListener('touchstart',e=>{if(e.touches.length>1)e.preventDefault();},{passive:false});
-// State
+
+// ── STATE ─────────────────────────────────────────────────────────────
 const TOK=(document.cookie.match(/ide_token=([^;]+)/)||[])[1]||'';
 const WS=(location.protocol==='https:'?'wss://':'ws://')+location.host;
-const api=async(u,o={})=>{try{const q=u.includes('?')?'&':'?';return(await fetch(u+q+'token='+TOK,o)).json();}catch(e){return{error:String(e)};}};
-let ed=null,fsize=14,tdata=[],tabs=[],aTab=null,curBot='',curFile='',logWs=null,ulDest='',sbVis=true,pVis=true,curP='o',probs=[];
-// Monaco
+const api=async(u,o={})=>{
+  try{const q=u.includes('?')?'&':'?';return(await fetch(u+q+'token='+TOK,o)).json();}
+  catch(e){return{error:String(e)};}
+};
+
+let ed=null, fsize=14, tdata=[], tabs=[], aTab=null;
+let curBot='', curFile='', logWs=null, ulDest='';
+let sbVis=true, panelVis=true, curP='out', probs=[];
+
+// ── MONACO ────────────────────────────────────────────────────────────
 require.config({paths:{vs:'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.46.0/min/vs'}});
 require(['vs/editor/editor.main'],()=>{
   ed=monaco.editor.create(document.getElementById('mc'),{
     value:'',language:'python',theme:'vs-dark',fontSize:fsize,
-    fontFamily:"'Cascadia Code','Fira Code',Consolas,monospace",fontLigatures:true,
-    automaticLayout:true,minimap:{enabled:false},scrollBeyondLastLine:false,lineNumbers:'on',
-    glyphMargin:true,folding:true,wordWrap:'off',smoothScrolling:true,cursorBlinking:'smooth',
-    cursorSmoothCaretAnimation:'on',renderLineHighlight:'line',bracketPairColorization:{enabled:true},
-    padding:{top:8,bottom:8},scrollbar:{vertical:'auto',horizontal:'auto',useShadows:false,
-    verticalScrollbarSize:6,horizontalScrollbarSize:6,alwaysConsumeMouseWheel:true},mouseWheelZoom:false,
+    fontFamily:"'Cascadia Code','Fira Code',Consolas,monospace",
+    fontLigatures:true,automaticLayout:true,
+    minimap:{enabled:false},
+    scrollBeyondLastLine:false,lineNumbers:'on',
+    glyphMargin:true,folding:true,wordWrap:'off',
+    smoothScrolling:true,cursorBlinking:'smooth',cursorSmoothCaretAnimation:'on',
+    renderLineHighlight:'line',bracketPairColorization:{enabled:true},
+    padding:{top:10,bottom:10},
+    scrollbar:{vertical:'auto',horizontal:'auto',useShadows:false,
+               verticalScrollbarSize:6,horizontalScrollbarSize:6,alwaysConsumeMouseWheel:true},
+    mouseWheelZoom:false,
     quickSuggestions:{other:true,comments:false,strings:false},
+    suggest:{showIcons:true},
   });
-  ed.onDidChangeCursorPosition(e=>{const p=ed.getPosition();if(p)document.getElementById('sb-l').textContent=`Ln ${p.lineNumber}, Col ${p.column}`;});
-  ed.onDidChangeModelContent(()=>{if(aTab&&aTab.type==='f'){aTab.dirty=true;rTabs();}});
-  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,save);
-  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Enter,run);
-  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Equal,()=>zE(1));
-  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Minus,()=>zE(-1));
-  rf(); setInterval(rf,25000); setInterval(syncSt,4500);
+
+  // Cursor pos → status bar
+  ed.onDidChangeCursorPosition(e=>{
+    const p=ed.getPosition();
+    if(p) document.getElementById('sb-ln').textContent=`Ln ${p.lineNumber}, Col ${p.column}`;
+  });
+
+  // Mark tab dirty on edit
+  ed.onDidChangeModelContent(()=>{
+    if(aTab&&aTab.type==='f'){aTab.dirty=true;renderTabs();}
+  });
+
+  // Keybindings
+  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS, save);
+  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Enter, run);
+  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Equal, ()=>zE(1));
+  ed.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Minus, ()=>zE(-1));
+
+  rf();
+  setInterval(rf, 25000);
+  setInterval(syncSt, 5000);
 });
-document.getElementById('ew').addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey){e.preventDefault();e.stopImmediatePropagation();zE(e.deltaY<0?1:-1);}},{passive:false,capture:true});
+
+// Editor-area Ctrl+Scroll → font size (NOT page zoom)
+document.getElementById('ed-wrap').addEventListener('wheel',e=>{
+  if(e.ctrlKey||e.metaKey){e.preventDefault();e.stopImmediatePropagation();zE(e.deltaY<0?1:-1);}
+},{passive:false,capture:true});
+
 function zE(d){fsize=Math.max(8,Math.min(28,fsize+d));if(ed)ed.updateOptions({fontSize:fsize});}
-function undo(){if(ed)ed.trigger('b','undo',null);}function redo(){if(ed)ed.trigger('b','redo',null);}
-// Tree
-async function rf(){const d=await api('/editor/api/tree');if(!d||d.error)return;tdata=Array.isArray(d)?d:[];rTree();}
-function rTree(){const el=document.getElementById('tr');if(!tdata.length){el.innerHTML='<div style="padding:18px;text-align:center;color:var(--tx3);font-size:12px">No bots.<br>Click ＋ to create.</div>';return;}
-  el.innerHTML=tdata.map(b=>{const op=b.name===curBot;const st=(b.status||'').toLowerCase();
-    const sc=st.includes('running')?'br':st.includes('stop')||st.includes('error')?'bs':'bo';
-    return `<div class="bi"><div class="bh ${op?'sel':''}" onclick="tBot('${x(b.name)}','${x(b.display||b.name)}',this)">
-      <span class="car ${op?'op':''}">▶</span><span style="font-size:14px;margin:0 3px">🤖</span>
-      <span class="bn">${x(b.display||b.name)}</span><span class="bst ${sc}">${x(b.status||'—')}</span>
-    </div><div class="bc ${op?'op':''}" id="bc-${I(b.name)}">
-      ${!b.has_files?'<div style="padding:6px 14px;color:var(--tx3);font-size:11px">Running in memory</div>'
-        :(b.children||[]).map(c=>fN(c,b.name)).join('')}
-    </div></div>`;}).join('');}
-function fN(n,bot){const sel=n.path===curFile?'sel':'';
-  if(n.type==='dir'){const did='d-'+I(n.path);return `<div><div class="fi fd" onclick="tDir('${did}',this)">
-    <span class="fic car" id="c-${did}">▶</span><span class="fic">📁</span><span class="fn fd">${x(n.name)}</span>
-    </div><div class="dc" id="${did}">${(n.children||[]).map(c=>fN(c,bot)).join('')}</div></div>`;}
-  return `<div class="fi ${sel}" onclick="oF('${x(n.path)}','${x(n.name)}','${x(bot)}')">
-    <span class="fic">${fi(n.ext)}</span><span class="fn">${x(n.name)}</span></div>`;}
-function tBot(name,disp,hdr){const ch=document.getElementById('bc-'+I(name));const cv=hdr.querySelector('.car');
-  const op=ch.classList.contains('op');if(!op)selB(name,disp);ch.classList.toggle('op',!op);cv.classList.toggle('op',!op);}
-function tDir(id,el){document.getElementById(id)?.classList.toggle('op');el.querySelector('.car')?.classList.toggle('op');}
-function selB(name,disp){curBot=name;const d=disp||name;document.getElementById('mb-b').textContent='🤖 '+d;
-  document.getElementById('sb-b').textContent='🤖 '+d;
-  document.getElementById('mb-nf').style.display='';document.getElementById('sb-nf').style.display='';document.getElementById('sb-nd').style.display='';
-  ulDest=name;cWs(name);syncSt();rTree();}
-function syncSt(){if(!curBot)return;const b=tdata.find(t=>t.name===curBot);if(!b)return;
-  const st=(b.status||'').toLowerCase();const col=st.includes('running')?'#4ec9b0':st.includes('error')?'#f44747':'#dcdcaa';
-  const s=document.getElementById('sb-s');s.textContent=b.status||'—';s.style.color=col;}
-// Tabs
-function rTabs(){const el=document.getElementById('et');el.querySelectorAll('.tab[data-p]').forEach(e=>e.remove());
-  const tw=document.getElementById('tw');const hf=tabs.filter(t=>t.type==='f').length>0;if(tw)tw.style.display=hf?'none':'';
-  tabs.filter(t=>t.type==='f').forEach(t=>{const d=document.createElement('div');
-    d.className='tab'+(t===aTab?' act':'')+(t.dirty?' dirty':'');d.dataset.p=t.path;
-    d.innerHTML=`<span>${fi(t.name.split('.').pop())}</span><span class="tn">${x(t.name)}</span><span class="tx" onclick="cTab('${x(t.path)}',event)">✕</span>`;
-    d.addEventListener('click',e=>{if(!e.target.classList.contains('tx'))actT(t);});el.appendChild(d);});}
-async function oF(path,name,bot){if(curBot&&curBot!==bot)selB(bot,bot);curFile=path;
-  let tab=tabs.find(t=>t.path===path&&t.type==='f');if(tab){actT(tab);return;}
-  const res=await api('/editor/api/file?path='+encodeURIComponent(path));if(res.error){toast('❌ '+res.error,'err');return;}
-  const model=monaco.editor.createModel(res.content,gL(name));tab={path,name,dirty:false,model,bot,type:'f'};tabs.push(tab);actT(tab);rTree();}
-function actT(tab){aTab=tab;if(ed&&tab.type==='f'){ed.setModel(tab.model);document.getElementById('wlc').classList.add('hide');document.getElementById('mc').style.display='';}
-  curFile=tab.path;if(!curBot&&tab.bot)selB(tab.bot,tab.bot);rTabs();}
-function cTab(path,e){if(e)e.stopPropagation();const idx=tabs.findIndex(t=>t.path===path&&t.type==='f');if(idx<0)return;
-  tabs[idx].model?.dispose();tabs.splice(idx,1);
-  if(aTab?.path===path){aTab=tabs.filter(t=>t.type==='f').slice(-1)[0]||null;
-    if(aTab)actT(aTab);else{if(ed)ed.setModel(null);document.getElementById('wlc').classList.remove('hide');}}rTabs();}
-// Save
-async function save(){if(!aTab||!ed||aTab.type!=='f')return;
-  const res=await api('/editor/api/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:aTab.path,content:ed.getValue()})});
-  if(res.error){toast('❌ '+res.error,'err');return;}aTab.dirty=false;rTabs();toast('💾 Saved','ok');}
-// Run
-async function run(){if(!curBot){toast('Select a bot first','err');return;}if(aTab?.dirty)await save();
+function doUndo(){if(ed)ed.trigger('b','undo',null);}
+function doRedo(){if(ed)ed.trigger('b','redo',null);}
+
+// ── TREE ──────────────────────────────────────────────────────────────
+async function rf(){
+  const d=await api('/editor/api/tree');
+  if(!d||d.error) return;
+  tdata=Array.isArray(d)?d:[];
+  renderTree();
+}
+
+function renderTree(){
+  const el=document.getElementById('tree');
+  if(!tdata.length){
+    el.innerHTML='<div style="padding:18px;text-align:center;color:var(--tx3);font-size:12px">No bots.<br>Click ＋ to create one.</div>';
+    return;
+  }
+  el.innerHTML=tdata.map(b=>{
+    const op=b.name===curBot;
+    const st=(b.status||'').toLowerCase();
+    const sc=st.includes('running')?'bst-r':st.includes('stop')||st.includes('error')?'bst-s':'bst-o';
+    return `<div class="bot-item">
+      <div class="bot-row ${op?'sel':''}" onclick="tBot('${x(b.name)}','${x(b.display||b.name)}',this)">
+        <span class="caret ${op?'op':''}">▶</span>
+        <span style="font-size:14px;margin:0 2px">🤖</span>
+        <span class="bname">${x(b.display||b.name)}</span>
+        <span class="bst ${sc}">${x(b.status||'—')}</span>
+      </div>
+      <div class="bot-children ${op?'op':''}" id="bc-${ID(b.name)}">
+        ${!b.has_files
+          ? '<div style="padding:6px 14px;color:var(--tx3);font-size:11px">Running in memory — files not found</div>'
+          : (b.children||[]).map(c=>fNode(c,b.name)).join('')}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function fNode(n, bot){
+  const sel=n.path===curFile?'sel':'';
+  if(n.type==='dir'){
+    const did='d-'+ID(n.path);
+    return `<div>
+      <div class="frow fname-dir" onclick="tDir('${did}',this)">
+        <span class="fic caret" id="c-${did}">▶</span>
+        <span class="fic">📁</span>
+        <span class="fname fname-dir">${x(n.name)}</span>
+      </div>
+      <div class="dch" id="${did}">${(n.children||[]).map(c=>fNode(c,bot)).join('')}</div>
+    </div>`;
+  }
+  return `<div class="frow ${sel}" onclick="openFile('${x(n.path)}','${x(n.name)}','${x(bot)}')">
+    <span class="fic">${fIco(n.ext)}</span>
+    <span class="fname">${x(n.name)}</span>
+  </div>`;
+}
+
+function tBot(name,disp,hdr){
+  const ch=document.getElementById('bc-'+ID(name));
+  const cv=hdr.querySelector('.caret');
+  const op=ch.classList.contains('op');
+  if(!op) selBot(name,disp);
+  ch.classList.toggle('op',!op);
+  cv.classList.toggle('op',!op);
+}
+function tDir(id,el){
+  document.getElementById(id)?.classList.toggle('op');
+  el.querySelector('.caret')?.classList.toggle('op');
+}
+
+function selBot(name,disp){
+  curBot=name;
+  const d=disp||name;
+  document.getElementById('bot-lbl').textContent='🤖 '+d;
+  document.getElementById('sb-bot').textContent='🤖 '+d;
+  document.getElementById('sb-nf').style.display='';
+  document.getElementById('sb-nd').style.display='';
+  ulDest=name;
+  connectWs(name);
+  syncSt();
+  renderTree();
+}
+
+function syncSt(){
+  if(!curBot) return;
+  const b=tdata.find(t=>t.name===curBot); if(!b) return;
+  const st=(b.status||'').toLowerCase();
+  const col=st.includes('running')?'#3fb950':st.includes('error')?'#f85149':'#d29922';
+  const ss=document.getElementById('sb-st');
+  ss.textContent=b.status||'—'; ss.style.color=col;
+}
+
+// ── FILE TABS (in top bar like Replit) ───────────────────────────────
+function renderTabs(){
+  const el=document.getElementById('file-tabs');
+  // Keep welcome tab
+  el.querySelectorAll('.ftab[data-p]').forEach(e=>e.remove());
+  const wt=document.getElementById('ft-welcome');
+  const hasFiles=tabs.filter(t=>t.type==='f').length>0;
+  if(wt) wt.style.display=hasFiles?'none':'';
+  tabs.filter(t=>t.type==='f').forEach(t=>{
+    const d=document.createElement('div');
+    d.className='ftab'+(t===aTab?' act':'')+(t.dirty?' dirty':'');
+    d.dataset.p=t.path;
+    d.innerHTML=`<span>${fIco(t.name.split('.').pop())}</span>
+      <span class="ftn">${x(t.name)}</span>
+      <span class="ftab-x" onclick="cTab('${x(t.path)}',event)">✕</span>`;
+    d.addEventListener('click',e=>{if(!e.target.classList.contains('ftab-x'))actTab(t);});
+    el.appendChild(d);
+  });
+}
+
+async function openFile(path,name,bot){
+  if(curBot&&curBot!==bot) selBot(bot,bot);
+  curFile=path;
+  let tab=tabs.find(t=>t.path===path&&t.type==='f');
+  if(tab){actTab(tab);return;}
+  const res=await api('/editor/api/file?path='+encodeURIComponent(path));
+  if(res.error){toast('❌ '+res.error,'err');return;}
+  const model=monaco.editor.createModel(res.content,gLang(name));
+  tab={path,name,dirty:false,model,bot,type:'f'};
+  tabs.push(tab); actTab(tab); renderTree();
+}
+
+function actTab(tab){
+  aTab=tab;
+  if(ed&&tab.type==='f'){
+    ed.setModel(tab.model);
+    document.getElementById('welcome').classList.add('hide');
+    document.getElementById('mc').style.display='';
+  }
+  curFile=tab.path;
+  if(!curBot&&tab.bot) selBot(tab.bot,tab.bot);
+  renderTabs();
+}
+
+function cTab(path,e){
+  if(e) e.stopPropagation();
+  const i=tabs.findIndex(t=>t.path===path&&t.type==='f'); if(i<0) return;
+  tabs[i].model?.dispose(); tabs.splice(i,1);
+  if(aTab?.path===path){
+    aTab=tabs.filter(t=>t.type==='f').slice(-1)[0]||null;
+    if(aTab) actTab(aTab);
+    else{
+      if(ed) ed.setModel(null);
+      document.getElementById('welcome').classList.remove('hide');
+    }
+  }
+  renderTabs();
+}
+
+// ── SAVE ──────────────────────────────────────────────────────────────
+async function save(){
+  if(!aTab||!ed||aTab.type!=='f') return;
+  const res=await api('/editor/api/file',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:aTab.path,content:ed.getValue()})
+  });
+  if(res.error){toast('❌ '+res.error,'err');return;}
+  aTab.dirty=false; renderTabs(); toast('💾 Saved','ok');
+}
+
+// ── RUN ───────────────────────────────────────────────────────────────
+async function run(){
+  if(!curBot){toast('Select a bot first','err');return;}
+  if(aTab?.dirty) await save();
+  const btn=document.getElementById('btn-run');
+  btn.classList.add('busy'); btn.innerHTML='⏳ <span>Stopping…</span>';
   addLog('▶ Stopping '+curBot+'…','i');
-  const res=await api('/editor/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bot:curBot})});
-  if(res.error){toast('❌ '+res.error,'err');addLog('❌ '+res.error,'e');return;}
-  addLog('▶ Restarting '+curBot+'…','i');toast('▶ Restarting…','info');setTimeout(()=>rf(),3500);}
-// New bot/file/dir
-async function doNB(){const n=document.getElementById('nb-n').value.trim();if(!n)return;
-  const r=await api('/editor/api/newbot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
-  cM('m-nb');if(r.error){toast('❌ '+r.error,'err');return;}toast('🤖 '+r.display+' created','ok');await rf();oF(r.main,'main.py',r.name);}
-async function doNF(){const n=document.getElementById('nf-n').value.trim();if(!n||!curBot)return;
-  const path=curBot+'/'+n;const r=await api('/editor/api/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,content:''})});
-  cM('m-nf');if(r.error){toast('❌ '+r.error,'err');return;}await rf();oF(path,n,curBot);}
-async function doND(){const n=document.getElementById('nd-n').value.trim();if(!n||!curBot)return;
-  const r=await api('/editor/api/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:curBot+'/'+n})});
-  cM('m-nd');if(r.error){toast('❌ '+r.error,'err');return;}toast('📁 Created','ok');rf();}
-async function delCur(){if(!curFile){toast('No file selected','err');return;}if(!confirm('Delete '+curFile+'?'))return;
-  const r=await api('/editor/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:curFile})});
-  if(r.error){toast('❌ '+r.error,'err');return;}cTab(curFile,null);curFile='';toast('🗑 Deleted','ok');rf();}
-// Upload
+  const res=await api('/editor/api/run',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({bot:curBot})
+  });
+  if(res.error){
+    toast('❌ '+res.error,'err');
+    addLog('❌ '+res.error,'e');
+    btn.classList.remove('busy'); btn.innerHTML='▶ <span>Run</span>';
+    return;
+  }
+  addLog('▶ Restarting '+curBot+'…','i');
+  toast('▶ Restarting…','info');
+  // Show output tab
+  showP('out');
+  setTimeout(()=>{btn.classList.remove('busy');btn.innerHTML='▶ <span>Run</span>';rf();},3500);
+}
+
+// ── NEW BOT / FILE / DIR / DEL ────────────────────────────────────────
+async function doNB(){
+  const n=document.getElementById('nb-n').value.trim(); if(!n) return;
+  const r=await api('/editor/api/newbot',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
+  cM('m-nb');
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  toast('🤖 '+r.display+' created','ok');
+  await rf(); openFile(r.main,'main.py',r.name);
+}
+async function doNF(){
+  const n=document.getElementById('nf-n').value.trim(); if(!n||!curBot) return;
+  const path=curBot+'/'+n;
+  const r=await api('/editor/api/file',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({path,content:''})});
+  cM('m-nf');
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  await rf(); openFile(path,n,curBot);
+}
+async function doND(){
+  const n=document.getElementById('nd-n').value.trim(); if(!n||!curBot) return;
+  const r=await api('/editor/api/mkdir',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({path:curBot+'/'+n})});
+  cM('m-nd');
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  toast('📁 Created','ok'); rf();
+}
+async function delFile(){
+  if(!curFile){toast('No file selected','err');return;}
+  if(!confirm('Delete '+curFile+'?')) return;
+  const r=await api('/editor/api/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({path:curFile})});
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  cTab(curFile,null); curFile=''; toast('🗑 Deleted','ok'); rf();
+}
+
+// ── UPLOAD ────────────────────────────────────────────────────────────
 function showUL(){document.getElementById('ul-d').textContent=ulDest||'/';oM('m-ul');}
-document.getElementById('finp').addEventListener('change',async e=>{await upF(e.target.files);e.target.value='';});
-async function upF(files){if(!files.length)return;const fd=new FormData();fd.append('dir',ulDest);
-  for(const f of files)fd.append('files',f,f.name);
+document.getElementById('finp').addEventListener('change',async e=>{
+  await upFiles(e.target.files); e.target.value='';
+});
+async function upFiles(files){
+  if(!files.length) return;
+  const fd=new FormData(); fd.append('dir',ulDest);
+  for(const f of files) fd.append('files',f,f.name);
   const r=await fetch('/editor/api/upload?token='+TOK,{method:'POST',body:fd}).then(r=>r.json());
-  cM('m-ul');if(r.error){toast('❌ '+r.error,'err');return;}toast('⬆ '+r.saved.length+' file(s)','ok');rf();}
+  cM('m-ul');
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  toast('⬆ '+r.saved.length+' file(s) uploaded','ok'); rf();
+}
 const dov=document.getElementById('dov');
 document.addEventListener('dragenter',e=>{if(e.dataTransfer.types.includes('Files'))dov.classList.add('show');});
 document.addEventListener('dragover',e=>e.preventDefault());
 document.addEventListener('dragleave',e=>{if(!e.relatedTarget)dov.classList.remove('show');});
-document.addEventListener('drop',async e=>{e.preventDefault();dov.classList.remove('show');await upF(e.dataTransfer.files);});
-// WebSocket
-function cWs(bot){if(logWs){try{logWs.close();}catch(e){}}
-  document.getElementById('pv-o').innerHTML=`<div class="ll li">── Connecting to ${bot} ──</div>`;
+document.addEventListener('drop',async e=>{e.preventDefault();dov.classList.remove('show');await upFiles(e.dataTransfer.files);});
+
+// ── WEBSOCKET — Output panel ──────────────────────────────────────────
+function connectWs(bot){
+  if(logWs){try{logWs.close();}catch(e){}}
+  const pv=document.getElementById('pv-out');
+  pv.innerHTML=`<div class="ll li">── Connecting to ${bot} ──</div>`;
   logWs=new WebSocket(`${WS}/editor/ws?token=${TOK}&bot=${encodeURIComponent(bot)}`);
-  logWs.onmessage=e=>addLog(e.data);logWs.onclose=()=>addLog('── Stream closed ──','i');logWs.onerror=()=>addLog('── WS error ──','e');}
-let _pb=[];
-function addLog(t,fc){const pv=document.getElementById('pv-o');const d=document.createElement('div');
-  const c=fc||((/error|exception|traceback/i.test(t))?'e':(/warn/i.test(t))?'w':(/▶|info|started|running/i.test(t))?'i':(/ok|success/i.test(t))?'o':(/^─+$/.test(t.trim()))?'s':'');
-  d.className='ll'+(c?' l'+c:'');d.textContent=t;pv.appendChild(d);
-  if(pv.scrollHeight-pv.scrollTop<pv.clientHeight+80)pv.scrollTop=pv.scrollHeight;
-  while(pv.children.length>3000)pv.removeChild(pv.firstChild);
-  _pb.push(t);if(_pb.length>80)_pb.shift();
-  if(/^(ModuleNotFoundError|SyntaxError|NameError|TypeError|AttributeError|ValueError|ImportError|RuntimeError|IndentationError|KeyError)/.test(t.trim())){bP(_pb.join('\n'));_pb=[];}}
-const HN=[[/ModuleNotFoundError: No module named '([^']+)'/,g=>`Install '${g[1]}' — add to requirements.txt`],[/SyntaxError: (.+)/,g=>`Syntax: ${g[1]} — check brackets/colons/quotes`],[/IndentationError: (.+)/,g=>`Indent: ${g[1]} — use 4 spaces`],[/NameError: name '([^']+)'/,g=>`'${g[1]}' not defined`],[/TypeError: (.+)/,g=>`Type: ${g[1]}`],[/AttributeError: '([^']+)' object has no attribute '([^']+)'/,g=>`'${g[1]}' has no '${g[2]}'`],[/KeyError: '?([^'\n]+)'?/,g=>`Key '${g[1]}' not in dict`],[/ImportError: cannot import name '([^']+)' from '([^']+)'/,g=>`Wrong import '${g[1]}' from '${g[2]}'`],[/Unauthorized/,g=>'Check bot token'],[/Conflict/,g=>'Another instance running — auto-fixing'],[/ZeroDivisionError/,g=>'Division by zero'],[/RecursionError/,g=>'Infinite recursion — add base case'],];
-function bP(text){let et='Error',em='',fn=null,ln=null,hint='Check Output.';
-  for(const l of text.split('\n')){const m=l.match(/File "([^"]+)", line (\d+)/);if(m){fn=l.match(/([^/\\]+)\.py/)?.[0]||m[1].split('/').pop();ln=parseInt(m[2]);}}
-  for(let i=text.split('\n').length-1;i>=0;i--){const l=text.split('\n')[i].trim();if(l&&!l.startsWith('File ')&&!l.startsWith('Traceback')&&!l.startsWith(' ')){em=l;et=l.split(':')[0].trim();break;}}
-  for(const[p,h]of HN){const m=text.match(p);if(m){hint=h(m);break;}}
-  if(!em)return;probs.unshift({et,em,fn,ln,hint});if(probs.length>50)probs.pop();rP();sP('p');}
-function rP(){const el=document.getElementById('pv-p');const cnt=document.getElementById('pc');const ec=document.getElementById('ec');
-  if(!probs.length){el.innerHTML='<div style="padding:10px;color:var(--tx2);font-size:12px">No problems.</div>';cnt.textContent='0';ec.style.display='none';return;}
-  cnt.textContent=String(probs.length);ec.textContent=String(probs.length);ec.style.display='';
-  el.innerHTML=probs.map(p=>`<div class="pi"><span class="pico">❌</span><div style="flex:1">
-    <div><b>${es(p.et)}:</b> ${es(p.em.slice(0,150))}</div>
-    ${p.fn&&p.ln?`<div class="plc">📍 ${es(p.fn)} — Line ${p.ln}</div>`:''}
-    <div class="ph">💡 ${es(p.hint)}</div></div></div>`).join('');}
-function clrP(){document.getElementById('pv-o').innerHTML='';probs=[];rP();}
-function pBot(){const pv=document.getElementById('pv-'+curP);if(pv)pv.scrollTop=pv.scrollHeight;}
-function sP(id){curP=id;['o','p','t'].forEach(p=>{document.getElementById('pt-'+p)?.classList.toggle('act',p===id);document.getElementById('pv-'+p)?.classList.toggle('act',p===id);});
-  if(!pVis){pVis=true;document.getElementById('pn').classList.remove('hide');document.getElementById('rp').style.display='';if(ed)ed.layout();}}
-// Toggles
-function tSB(on){sbVis=on!==undefined?on:!sbVis;document.getElementById('sb').classList.toggle('hide',!sbVis);document.getElementById('rs').style.display=sbVis?'':'none';document.getElementById('ab-e').classList.toggle('on',sbVis);if(ed)ed.layout();}
-function tP(){pVis=!pVis;document.getElementById('pn').classList.toggle('hide',!pVis);document.getElementById('rp').style.display=pVis?'':'none';if(ed)ed.layout();}
-// Resize sidebar
-(()=>{const rsz=document.getElementById('rs'),sb=document.getElementById('sb');let dr=false,sx=0,sw=0;
+  logWs.onmessage=e=>addLog(e.data);
+  logWs.onclose=()=>addLog('── Stream closed ──','i');
+  logWs.onerror=()=>addLog('── WebSocket error ──','e');
+}
+
+let _pbuf=[];
+function addLog(txt,fc){
+  const pv=document.getElementById('pv-out');
+  const d=document.createElement('div');
+  const c=fc||(/error|exception|traceback/i.test(txt)?'e':
+    /warn/i.test(txt)?'w':/▶|info|started|running/i.test(txt)?'i':
+    /ok|success|done/i.test(txt)?'o':/^─+$/.test(txt.trim())?'s':'');
+  d.className='ll'+(c?' l'+c:'');
+  d.textContent=txt; pv.appendChild(d);
+  if(pv.scrollHeight-pv.scrollTop<pv.clientHeight+80) pv.scrollTop=pv.scrollHeight;
+  while(pv.children.length>3000) pv.removeChild(pv.firstChild);
+  // Problems detection
+  _pbuf.push(txt); if(_pbuf.length>80) _pbuf.shift();
+  if(/^(ModuleNotFoundError|SyntaxError|NameError|TypeError|AttributeError|ValueError|ImportError|RuntimeError|IndentationError|KeyError|FileNotFoundError)/.test(txt.trim())){
+    buildProb(_pbuf.join('\n')); _pbuf=[];
+  }
+}
+
+// ── PROBLEMS TAB ──────────────────────────────────────────────────────
+const HINTS=[
+  [/ModuleNotFoundError: No module named '([^']+)'/,g=>`Install '${g[1]}' — add to requirements.txt`],
+  [/SyntaxError: (.+)/,g=>`Syntax: ${g[1]} — check brackets/colons/quotes`],
+  [/IndentationError: (.+)/,g=>`Indentation: ${g[1]} — use 4 spaces`],
+  [/NameError: name '([^']+)'/,g=>`'${g[1]}' not defined — check spelling`],
+  [/TypeError: (.+)/,g=>`Type error: ${g[1]}`],
+  [/AttributeError: '([^']+)' object has no attribute '([^']+)'/,g=>`'${g[1]}' has no '${g[2]}'`],
+  [/KeyError: '?([^'\n]+)'?/,g=>`Key '${g[1]}' not in dict`],
+  [/ImportError: cannot import name '([^']+)' from '([^']+)'/,g=>`Wrong import '${g[1]}' from '${g[2]}'`],
+  [/FileNotFoundError/,g=>'File not found — check path'],
+  [/Unauthorized/,g=>'Unauthorized — check bot token'],
+  [/Conflict/,g=>'Another bot instance running — auto-fixing'],
+  [/ZeroDivisionError/,g=>'Division by zero'],
+  [/RecursionError/,g=>'Infinite recursion — add a base case'],
+];
+
+function buildProb(text){
+  let et='Error',em='',fn=null,ln=null,hint='Check Output panel.';
+  for(const l of text.split('\n')){
+    const m=l.match(/File "([^"]+)", line (\d+)/);
+    if(m){fn=l.match(/([^/\\]+)\.py/)?.[0]||m[1].split('/').pop();ln=parseInt(m[2]);}
+  }
+  for(let i=text.split('\n').length-1;i>=0;i--){
+    const l=text.split('\n')[i].trim();
+    if(l&&!l.startsWith('File ')&&!l.startsWith('Traceback')&&!l.startsWith(' ')){
+      em=l; et=l.split(':')[0].trim(); break;
+    }
+  }
+  for(const[p,h]of HINTS){const m=text.match(p);if(m){hint=h(m);break;}}
+  if(!em) return;
+  probs.unshift({et,em,fn,ln,hint,ts:Date.now()});
+  if(probs.length>50) probs.pop();
+  renderProbs(); showP('prob');
+}
+
+function renderProbs(){
+  const el=document.getElementById('pv-prob');
+  const dot=document.getElementById('prob-dot');
+  const badge=document.getElementById('err-badge');
+  if(!probs.length){
+    el.innerHTML='<div style="padding:10px 0;color:var(--tx2);font-size:12px">No problems detected. Run your bot to check.</div>';
+    dot.classList.remove('show'); badge.style.display='none'; return;
+  }
+  dot.classList.add('show'); badge.textContent=String(probs.length); badge.style.display='';
+  el.innerHTML=probs.map(p=>`
+    <div class="prob">
+      <span class="prob-ico">${p.et.includes('Syntax')||p.et.includes('Indent')?'✏️':'❌'}</span>
+      <div class="prob-body">
+        <div class="prob-msg"><b>${es(p.et)}:</b> ${es(p.em.slice(0,160))}</div>
+        ${p.fn&&p.ln?`<div class="prob-loc">📍 ${es(p.fn)} — Line ${p.ln}</div>`:''}
+        <div class="prob-hint">💡 ${es(p.hint)}</div>
+      </div>
+    </div>`).join('');
+}
+
+function clrPanel(){
+  document.getElementById('pv-out').innerHTML='';
+  probs=[]; renderProbs();
+}
+function panelBot(){
+  const pv=document.getElementById('pv-'+curP);
+  if(pv) pv.scrollTop=pv.scrollHeight;
+}
+
+// ── PANEL TAB SWITCH ──────────────────────────────────────────────────
+function showP(id){
+  curP=id;
+  ['out','prob','term'].forEach(p=>{
+    document.getElementById('pt-'+p)?.classList.toggle('act',p===id);
+    document.getElementById('pv-'+p)?.classList.toggle('act',p===id);
+  });
+  if(!panelVis){panelVis=true;document.getElementById('panel').classList.remove('hide');
+    document.getElementById('rpanel').style.display='';if(ed)ed.layout();}
+}
+
+// ── SIDEBAR / PANEL TOGGLE ────────────────────────────────────────────
+function tSB(on){
+  sbVis=on!==undefined?on:!sbVis;
+  document.getElementById('sidebar').classList.toggle('hide',!sbVis);
+  document.getElementById('rsb').style.display=sbVis?'':'none';
+  document.getElementById('ab-e').classList.toggle('on',sbVis);
+  document.getElementById('btn-sb').classList.toggle('on',sbVis);
+  if(ed) ed.layout();
+}
+function tPanel(){
+  panelVis=!panelVis;
+  document.getElementById('panel').classList.toggle('hide',!panelVis);
+  document.getElementById('rpanel').style.display=panelVis?'':'none';
+  document.getElementById('btn-panel').classList.toggle('on',panelVis);
+  if(ed) ed.layout();
+}
+
+// ── RESIZE SIDEBAR ────────────────────────────────────────────────────
+(()=>{
+  const rsz=document.getElementById('rsb'),sb=document.getElementById('sidebar');
+  let dr=false,sx=0,sw=0;
   const st=e=>{if(!sbVis)return;dr=true;sx=e.clientX||(e.touches?.[0]?.clientX||0);sw=sb.offsetWidth;rsz.classList.add('on');e.preventDefault();};
-  const mv=e=>{if(!dr)return;const cx=e.clientX||(e.touches?.[0]?.clientX||0);const w=Math.max(120,Math.min(480,sw+(cx-sx)));sb.style.width=w+'px';if(ed)ed.layout();};
+  const mv=e=>{if(!dr)return;const cx=e.clientX||(e.touches?.[0]?.clientX||0);const w=Math.max(150,Math.min(400,sw+(cx-sx)));sb.style.width=w+'px';if(ed)ed.layout();};
   const en=()=>{dr=false;rsz.classList.remove('on');};
   rsz.addEventListener('mousedown',st);rsz.addEventListener('touchstart',st,{passive:false});
   document.addEventListener('mousemove',mv);document.addEventListener('touchmove',mv,{passive:true});
-  document.addEventListener('mouseup',en);document.addEventListener('touchend',en);})();
-// Resize panel
-(()=>{const rsz=document.getElementById('rp'),p=document.getElementById('pn');let dr=false,sy=0,sh=0;
-  const st=e=>{if(!pVis)return;dr=true;sy=e.clientY||(e.touches?.[0]?.clientY||0);sh=p.offsetHeight;rsz.classList.add('on');e.preventDefault();};
-  const mv=e=>{if(!dr)return;const cy=e.clientY||(e.touches?.[0]?.clientY||0);const h=Math.max(60,Math.min(window.innerHeight*0.65,sh-(cy-sy)));p.style.height=h+'px';if(ed)ed.layout();};
+  document.addEventListener('mouseup',en);document.addEventListener('touchend',en);
+})();
+
+// ── RESIZE PANEL ──────────────────────────────────────────────────────
+(()=>{
+  const rsz=document.getElementById('rpanel'),panel=document.getElementById('panel');
+  let dr=false,sy=0,sh=0;
+  const st=e=>{if(!panelVis)return;dr=true;sy=e.clientY||(e.touches?.[0]?.clientY||0);sh=panel.offsetHeight;rsz.classList.add('on');e.preventDefault();};
+  const mv=e=>{if(!dr)return;const cy=e.clientY||(e.touches?.[0]?.clientY||0);const h=Math.max(80,Math.min(window.innerHeight*0.65,sh-(cy-sy)));panel.style.height=h+'px';if(ed)ed.layout();};
   const en=()=>{dr=false;rsz.classList.remove('on');};
   rsz.addEventListener('mousedown',st);rsz.addEventListener('touchstart',st,{passive:false});
   document.addEventListener('mousemove',mv);document.addEventListener('touchmove',mv,{passive:true});
-  document.addEventListener('mouseup',en);document.addEventListener('touchend',en);})();
-// Keyboard
-document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA')return;
+  document.addEventListener('mouseup',en);document.addEventListener('touchend',en);
+})();
+
+// ── KEYBOARD SHORTCUTS ────────────────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA') return;
   const k=e.key.toLowerCase();
-  if(!e.ctrlKey&&!e.metaKey&&k==='b')tSB();if(!e.ctrlKey&&!e.metaKey&&k==='t')tP();
+  if(!e.ctrlKey&&!e.metaKey&&k==='b') tSB();
+  if(!e.ctrlKey&&!e.metaKey&&k==='t') tPanel();
+  if(!e.ctrlKey&&!e.metaKey&&k==='`') showP('out');
   if((e.ctrlKey||e.metaKey)&&k==='s'){e.preventDefault();save();}
   if((e.ctrlKey||e.metaKey)&&k==='enter'){e.preventDefault();run();}
-  if((e.ctrlKey||e.metaKey)&&k==='z')undo();
-  if((e.ctrlKey||e.metaKey)&&(e.shiftKey&&k==='z'||k==='y'))redo();});
-// Modals
-function oM(id){document.getElementById(id).classList.add('show');const inp=document.getElementById(id).querySelector('input');if(inp){inp.value='';setTimeout(()=>inp.focus(),50);}}
+  if((e.ctrlKey||e.metaKey)&&k==='z') doUndo();
+  if((e.ctrlKey||e.metaKey)&&(e.shiftKey&&k==='z'||k==='y')) doRedo();
+  if((e.ctrlKey||e.metaKey)&&k==='n'){e.preventDefault();oM('m-nb');}
+});
+
+// ── MODALS ────────────────────────────────────────────────────────────
+function oM(id){
+  document.getElementById(id).classList.add('show');
+  const inp=document.getElementById(id).querySelector('input');
+  if(inp){inp.value='';setTimeout(()=>inp.focus(),50);}
+}
 function cM(id){document.getElementById(id).classList.remove('show');}
-document.querySelectorAll('.mov').forEach(bg=>{bg.addEventListener('click',e=>{if(e.target===bg)bg.classList.remove('show');});});
+document.querySelectorAll('.mov').forEach(bg=>{
+  bg.addEventListener('click',e=>{if(e.target===bg)bg.classList.remove('show');});
+});
 document.getElementById('nb-n').addEventListener('keydown',e=>e.key==='Enter'&&doNB());
 document.getElementById('nf-n').addEventListener('keydown',e=>e.key==='Enter'&&doNF());
 document.getElementById('nd-n').addEventListener('keydown',e=>e.key==='Enter'&&doND());
-// Toast
-let _tt;function toast(msg,type='ok'){const el=document.getElementById('toast');el.textContent=msg;el.className='show '+type;clearTimeout(_tt);_tt=setTimeout(()=>el.className='',3000);}
-// Helpers
+
+// ── TOAST ─────────────────────────────────────────────────────────────
+let _tt;
+function toast(msg,type='ok'){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.className='show '+type;
+  clearTimeout(_tt); _tt=setTimeout(()=>el.className='',3000);
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────
 function es(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-function x(s){return es(s);}function I(s){return String(s).replace(/[^a-zA-Z0-9]/g,'_');}
-function fi(e){return{py:'🐍',js:'📜',ts:'📜',json:'{}',txt:'📄',md:'📝',sh:'⚙',yml:'⚙',yaml:'⚙',env:'🔑',html:'🌐',css:'🎨',png:'🖼',jpg:'🖼',gif:'🖼',zip:'📦',log:'📋',cfg:'⚙',ini:'⚙',toml:'⚙',sql:'🗄'}[e]||'📄';}
-function gL(n){const e=n.split('.').pop().toLowerCase();return{py:'python',js:'javascript',ts:'typescript',json:'json',html:'html',css:'css',sh:'shell',md:'markdown',yml:'yaml',yaml:'yaml',sql:'sql',txt:'plaintext',toml:'ini',cfg:'ini',ini:'ini'}[e]||'plaintext';}
-</script></body></html>"""
+function x(s){return es(s);}
+function ID(s){return String(s).replace(/[^a-zA-Z0-9]/g,'_');}
+function fIco(e){
+  return{py:'🐍',js:'📜',ts:'📜',json:'{}',txt:'📄',md:'📝',sh:'⚙',
+    yml:'⚙',yaml:'⚙',env:'🔑',html:'🌐',css:'🎨',png:'🖼',jpg:'🖼',
+    gif:'🖼',zip:'📦',log:'📋',cfg:'⚙',ini:'⚙',toml:'⚙',sql:'🗄',db:'🗄'}[e]||'📄';
+}
+function gLang(n){
+  const e=n.split('.').pop().toLowerCase();
+  return{py:'python',js:'javascript',ts:'typescript',json:'json',html:'html',
+    css:'css',sh:'shell',md:'markdown',yml:'yaml',yaml:'yaml',
+    sql:'sql',txt:'plaintext',toml:'ini',cfg:'ini',ini:'ini'}[e]||'plaintext';
+}
+</script>
+</body></html>"""
+
