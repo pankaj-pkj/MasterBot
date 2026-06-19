@@ -1,7 +1,18 @@
-python-telegram-bot[job-queue]==20.8
-aiohttp==3.9.5
-nest_asyncio
-requests
-httpx>=0.26.0,<0.27.0
-httpcore==1.0.5
+# ────────────────────────────────────────────────────────────────────
+#  Master Hosting Bot v4.3  —  requirements.txt
+#  Python 3.11  |  Render.com Free Tier
+#
+#  FIX: pinned httpx + httpcore explicitly to avoid Render build fail
+#  Error was: "No matching distribution found for httpcore==1.*"
+# ────────────────────────────────────────────────────────────────────
 
+# Telegram bot framework
+python-telegram-bot[job-queue]==20.8
+
+# Async HTTP client + web server
+aiohttp==3.9.5
+
+# PTB dependency — pin to avoid Render resolution timeout
+httpx==0.27.2
+httpcore==1.0.5
+anyio==4.3.0
