@@ -34,11 +34,15 @@ _TOKENS_FILE      = DATA_DIR / "user_tokens.json"
 _BLOCKED_IPS_FILE = DATA_DIR / "ide_blocked_ips.json"
 
 
-def init_editor(running_bots, app_ref=None, admin_ids=None):
-    global _RUNNING_BOTS, _APP_REF, _ADMIN_IDS
+_RUN_BOT_FN = None   # set by main.py so IDE can start stopped bots
+
+
+def init_editor(running_bots, app_ref=None, admin_ids=None, run_bot_fn=None):
+    global _RUNNING_BOTS, _APP_REF, _ADMIN_IDS, _RUN_BOT_FN
     _RUNNING_BOTS = running_bots
     _APP_REF      = app_ref
     _ADMIN_IDS    = admin_ids or set()
+    _RUN_BOT_FN   = run_bot_fn
 
 
 # ── Token / Auth ──────────────────────────────────────────────────────
@@ -274,20 +278,29 @@ async def api_run(req):
         bot_dir=HOSTED_DIR/bot
         if not (bot_dir/"main.py").exists():
             return web.json_response({"error":"main.py not found"},status=404)
+
         e=_RUNNING_BOTS.get(bot)
-        if e:
-            e["active"]=False; p=e.get("process")
+
+        if e and e.get("active"):
+            # Bot IS running — write flag + kill process.
+            # DO NOT set active=False — that kills the run_bot loop permanently.
+            # The loop checks restart_flag mid-run and restarts cleanly.
+            e["status"]="Restarting ⏳"
+            (bot_dir/".restart_flag").write_text(str(time.time()))
+            p=e.get("process")
             if p and p.poll() is None:
                 p.terminate()
-                for _ in range(8):
-                    await asyncio.sleep(0.5)
-                    if p.poll() is not None: break
-                else:
-                    try: p.kill()
-                    except: pass
-            e["active"]=True; e["status"]="Restarting ⏳"
-        (bot_dir/".restart_flag").write_text(str(time.time()))
-        return web.json_response({"ok":True,"bot":bot})
+                # Don't wait here — loop handles it
+        else:
+            # Bot is NOT running — start it fresh via run_bot_fn callback
+            reg_owner = _reg().get(bot,{}).get("owner_id", uid)
+            if _RUN_BOT_FN:
+                asyncio.create_task(_RUN_BOT_FN(bot, bot_dir, reg_owner, stagger=False))
+            else:
+                # Fallback: write flag, if loop exists it'll pick it up
+                (bot_dir/".restart_flag").write_text(str(time.time()))
+
+        return web.json_response({"ok":True,"bot":bot,"msg":"Restarting…"})
     except Exception as ex: return web.json_response({"error":str(ex)},status=500)
 
 async def api_logs(req):
@@ -1051,37 +1064,55 @@ function cTab(path,e){
 
 // ── SAVE ──────────────────────────────────────────────────────────────
 async function save(){
-  if(!aTab||!ed||aTab.type!=='f') return;
+  if(!ed) return;
+  if(!aTab||aTab.type!=='f'){toast('No file open to save','err');return;}
+  const content=ed.getValue();
+  if(!content&&!confirm('Save empty file?')) return;
   const res=await api('/editor/api/file',{
     method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({path:aTab.path,content:ed.getValue()})
+    body:JSON.stringify({path:aTab.path,content})
   });
-  if(res.error){toast('❌ '+res.error,'err');return;}
-  aTab.dirty=false; renderTabs(); toast('💾 Saved','ok');
+  if(res.error){toast('❌ Save failed: '+res.error,'err');return;}
+  aTab.dirty=false;
+  renderTabs();
+  // Update status bar briefly
+  const sb=document.getElementById('sb-st');
+  const prev=sb.textContent;
+  sb.textContent='💾 Saved'; sb.style.color='#3fb950';
+  setTimeout(()=>{sb.style.color='';syncSt();},2000);
+  toast('💾 '+aTab.name+' saved','ok');
 }
 
 // ── RUN ───────────────────────────────────────────────────────────────
 async function run(){
   if(!curBot){toast('Select a bot first','err');return;}
-  if(aTab?.dirty) await save();
+  // Auto-save first
+  if(aTab&&aTab.dirty) await save();
   const btn=document.getElementById('btn-run');
   btn.classList.add('busy'); btn.innerHTML='⏳ <span>Stopping…</span>';
-  addLog('▶ Stopping '+curBot+'…','i');
+  // Switch to Output tab and show progress
+  showP('out');
+  addLog('─────────────────────────────────','s');
+  addLog('▶ Saving & restarting '+curBot+'…','i');
   const res=await api('/editor/api/run',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({bot:curBot})
   });
   if(res.error){
     toast('❌ '+res.error,'err');
-    addLog('❌ '+res.error,'e');
+    addLog('❌ Run failed: '+res.error,'e');
     btn.classList.remove('busy'); btn.innerHTML='▶ <span>Run</span>';
     return;
   }
-  addLog('▶ Restarting '+curBot+'…','i');
-  toast('▶ Restarting…','info');
-  // Show output tab
-  showP('out');
-  setTimeout(()=>{btn.classList.remove('busy');btn.innerHTML='▶ <span>Run</span>';rf();},3500);
+  addLog('⏳ Process stopping…','i');
+  // Reconnect WebSocket after short delay so we get fresh output
+  setTimeout(()=>{
+    addLog('▶ Starting '+curBot+'…','i');
+    connectWs(curBot);   // reconnect to get fresh log stream
+    btn.classList.remove('busy'); btn.innerHTML='▶ <span>Run</span>';
+    rf();
+    toast('▶ Bot restarted!','ok');
+  }, 2500);
 }
 
 // ── NEW BOT / FILE / DIR / DEL ────────────────────────────────────────
@@ -1155,10 +1186,17 @@ let _pbuf=[];
 function addLog(txt,fc){
   const pv=document.getElementById('pv-out');
   const d=document.createElement('div');
+  // Classify line
   const c=fc||(/error|exception|traceback/i.test(txt)?'e':
-    /warn/i.test(txt)?'w':/▶|info|started|running/i.test(txt)?'i':
-    /ok|success|done/i.test(txt)?'o':/^─+$/.test(txt.trim())?'s':'');
+    /warn/i.test(txt)?'w':
+    /▶|\[start\]|started|running|✅|🟢/i.test(txt)?'i':
+    /ok|success|done|💡|\[heal\]/i.test(txt)?'o':
+    /^─+$/.test(txt.trim())?'s':'');
   d.className='ll'+(c?' l'+c:'');
+  // Highlight print() output from bot (plain text with no prefix)
+  if(!c && txt.trim() && !txt.startsWith('[') && !txt.startsWith('─')){
+    d.style.color='#e6edf3';  // bright white for bot print output
+  }
   d.textContent=txt; pv.appendChild(d);
   if(pv.scrollHeight-pv.scrollTop<pv.clientHeight+80) pv.scrollTop=pv.scrollHeight;
   while(pv.children.length>3000) pv.removeChild(pv.firstChild);
