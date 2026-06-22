@@ -303,6 +303,25 @@ async def api_run(req):
         return web.json_response({"ok":True,"bot":bot,"msg":"Restarting…"})
     except Exception as ex: return web.json_response({"error":str(ex)},status=500)
 
+async def api_stop(req):
+    uid,ia=_auth(req)
+    if not uid: return web.json_response({"error":"unauthorized"},status=401)
+    try:
+        body=await req.json(); bot=body.get("bot","").strip()
+        if not bot: return web.json_response({"error":"bot required"},status=400)
+        if not _can(uid,ia,bot): return web.json_response({"error":"forbidden"},status=403)
+        e=_RUNNING_BOTS.get(bot)
+        if e:
+            # active=False ends the run_bot loop so it stays stopped
+            e["active"]=False
+            p=e.get("process")
+            if p and p.poll() is None:
+                try: p.terminate()
+                except Exception: pass
+            e["status"]="Stopped 🛑"
+        return web.json_response({"ok":True,"bot":bot,"msg":"Stopped"})
+    except Exception as ex: return web.json_response({"error":str(ex)},status=500)
+
 async def api_logs(req):
     uid,ia=_auth(req)
     if not uid: return web.json_response({"error":"unauthorized"},status=401)
@@ -366,6 +385,7 @@ def register_routes(app):
     app.router.add_post("/editor/api/upload", api_upload)
     app.router.add_post("/editor/api/newbot", api_newbot)
     app.router.add_post("/editor/api/run",    api_run)
+    app.router.add_post("/editor/api/stop",   api_stop)
     app.router.add_get("/editor/api/logs",    api_logs)
     app.router.add_get("/editor/ws",          ws_logs)
     log.info("Web IDE v6.0 ready at /editor")
@@ -481,6 +501,8 @@ body{height:100svh;overflow:hidden;touch-action:none}
 .tbtn:hover{border-color:var(--blue);color:var(--tx)}
 .tbtn.run{border-color:var(--green);color:var(--green);background:#0d2014}
 .tbtn.run:hover,.tbtn.run.busy{background:var(--green);color:#fff;pointer-events:none}
+.tbtn.stop{border-color:var(--red);color:var(--red);background:#20100d}
+.tbtn.stop:hover{background:var(--red);color:#fff}
 .tbtn.on{border-color:var(--blue);color:var(--blue)}
 #bot-lbl{font-size:12px;color:var(--pur);font-weight:700;max-width:100px;
          overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -734,6 +756,7 @@ body{height:100svh;overflow:hidden;touch-action:none}
       <button class="tbtn" onclick="showUL()" title="Upload">⬆</button>
       <button class="tbtn" onclick="save()" title="Save [Ctrl+S]">💾 <span>Save</span></button>
       <button class="tbtn run" id="btn-run" onclick="run()">▶ <span>Run</span></button>
+      <button class="tbtn stop" id="btn-stop" onclick="stop()" title="Stop">⏹ <span>Stop</span></button>
       <button class="tbtn on" id="btn-sb" onclick="tSB()" title="Files [B]">☰</button>
       <button class="tbtn on" id="btn-panel" onclick="tPanel()" title="Console [T]">⬛</button>
     </div>
@@ -1113,6 +1136,19 @@ async function run(){
     rf();
     toast('▶ Bot restarted!','ok');
   }, 2500);
+}
+
+// ── STOP ──────────────────────────────────────────────────────────────
+async function stop(){
+  if(!curBot){toast('Select a bot first','err');return;}
+  showP('out');
+  addLog('⏹ Stopping '+curBot+'…','w');
+  const res=await api('/editor/api/stop',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({bot:curBot})
+  });
+  if(res.error){toast('❌ '+res.error,'err');addLog('❌ Stop failed: '+res.error,'e');return;}
+  addLog('🛑 Stopped.','w'); toast('🛑 Bot stopped','ok'); rf();
 }
 
 // ── NEW BOT / FILE / DIR / DEL ────────────────────────────────────────

@@ -404,8 +404,9 @@ async def try_heal(name: str, bot_dir: Path, parsed: dict, heal_count: int) -> b
     if module and "ModuleNotFoundError" in err_type:
         pkg = IMPORT_MAP.get(module, module)
         log.info("HEAL [%s]: pip install %s", name, pkg)
-        ret = subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"],
-                             timeout=120, capture_output=True)
+        ret = await asyncio.to_thread(
+            subprocess.run, [sys.executable, "-m", "pip", "install", pkg, "-q"],
+            timeout=120, capture_output=True)
         if ret.returncode == 0:
             _wlog(bot_dir, f"[HEAL] Installed {pkg} — restarting…\n"); return True
         return False
@@ -474,10 +475,26 @@ def _jsave(p: Path, data):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-def load_users():    return _jload(DATA_DIR/"users.json", {})
-def save_users(d):   _jsave(DATA_DIR/"users.json", d)
-def load_registry(): return _jload(DATA_DIR/"registry.json", {})
-def save_registry(d):_jsave(DATA_DIR/"registry.json", d)
+# ── mtime-cached loaders ──────────────────────────────────────────────
+# These files are read on almost every Telegram update. Re-reading +
+# JSON-parsing from disk each time adds latency to every command.
+# Cache the parsed result and only re-read when the file actually changes
+# on disk (mtime check), so command responses stay instant.
+_REG_CACHE   = {"mtime": -1.0, "data": {}}
+_USERS_CACHE = {"mtime": -1.0, "data": {}}
+
+def _jload_cached(p: Path, cache: dict):
+    try: m = p.stat().st_mtime
+    except OSError: return {}
+    if m != cache["mtime"]:
+        cache["data"]  = _jload(p, {})
+        cache["mtime"] = m
+    return cache["data"]
+
+def load_users():    return _jload_cached(DATA_DIR/"users.json", _USERS_CACHE)
+def save_users(d):   _jsave(DATA_DIR/"users.json", d); _USERS_CACHE["mtime"] = -1.0
+def load_registry(): return _jload_cached(DATA_DIR/"registry.json", _REG_CACHE)
+def save_registry(d):_jsave(DATA_DIR/"registry.json", d); _REG_CACHE["mtime"] = -1.0
 
 def load_usernames():
     global USER_NAMES; USER_NAMES = _jload(DATA_DIR/"usernames.json", {})
@@ -560,10 +577,24 @@ def _clone():
     if _git(f'git clone "{REPO_URL}" "{HOSTED_DIR}"') != 0:
         HOSTED_DIR.mkdir(exist_ok=True)
 
-def push_to_github(msg="Update"):
+def _push_sync(msg="Update"):
     if not GITHUB_PAT: return
     _git(f'cd "{HOSTED_DIR}" && git add -A && '
          f'(git diff --cached --quiet || git commit -m "{msg}") && git push')
+
+def push_to_github(msg="Update"):
+    """
+    Non-blocking git push. git over os.system can take several seconds and
+    would otherwise FREEZE the asyncio event loop — stalling polling and
+    every hosted bot. When called from inside the running loop we offload
+    the push to a background thread (fire-and-forget) so the command that
+    triggered it returns instantly.
+    """
+    if not GITHUB_PAT: return
+    try:
+        asyncio.get_running_loop().run_in_executor(None, _push_sync, msg)
+    except RuntimeError:
+        _push_sync(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -731,6 +762,138 @@ async def node_health_monitor():
         except Exception as e:
             log.warning("Health monitor error: %s", e)
         await asyncio.sleep(60)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RAM GUARD  —  proactive memory-based offloading
+#  Render free tier ≈ 512MB. If too many child bots run locally the
+#  container is OOM-killed and Render stops the whole service.
+#  This loop watches container memory and, BEFORE it gets critical,
+#  moves local bots onto worker nodes so the master stays alive.
+# ══════════════════════════════════════════════════════════════════════
+
+MEM_CHECK_SEC = 20      # how often to sample memory
+MEM_HIGH_PCT  = 82.0    # start offloading bots above this %
+MEM_CRIT_PCT  = 90.0    # alert admin if we can't offload (no free node)
+MEM_EASE_PCT  = 72.0    # stop offloading once back under this %
+MEM_MAX_MOVE  = 3       # max bots moved per cycle (let RAM settle)
+
+
+def _read_int(path: str):
+    try: return int(Path(path).read_text().strip())
+    except Exception: return None
+
+
+def get_mem_percent() -> float:
+    """Best-effort container memory usage %. Tries cgroup v2 → v1 → /proc."""
+    # cgroup v2 (modern Render / docker)
+    cur = _read_int("/sys/fs/cgroup/memory.current")
+    mx  = Path("/sys/fs/cgroup/memory.max")
+    if cur is not None and mx.exists():
+        raw = mx.read_text().strip()
+        if raw.isdigit() and int(raw) > 0:
+            return cur / int(raw) * 100.0
+    # cgroup v1
+    cur1 = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    lim1 = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if cur1 and lim1 and lim1 < (1 << 62):
+        return cur1 / lim1 * 100.0
+    # /proc/meminfo (host-wide fallback)
+    try:
+        info = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":"); info[k.strip()] = v
+        total = int(info["MemTotal"].split()[0])
+        avail = int(info["MemAvailable"].split()[0])
+        return (total - avail) / total * 100.0
+    except Exception:
+        return 0.0
+
+
+async def offload_bots_for_memory(pct: float) -> int:
+    """Move local bots → least-loaded worker node until RAM eases."""
+    statuses = await all_node_statuses()
+    live = [s for s in statuses if s["online"] and s["enabled"]]
+    if not live:
+        return 0
+    reg   = load_registry()
+    local = [(k, v) for k, v in reg.items() if v.get("node", "local") == "local"]
+    # Move the most-recently-started bots first (least "settled").
+    local.sort(key=lambda kv: RUNNING_BOTS.get(kv[0], {}).get("start_time", 0),
+               reverse=True)
+    moved = 0
+    for bot_key, v in local:
+        if get_mem_percent() < MEM_EASE_PCT:
+            break
+        bot_dir  = HOSTED_DIR / bot_key
+        owner_id = v.get("owner_id", 0)
+        if not (bot_dir / "main.py").exists():
+            continue
+        best = min(live, key=lambda s: s["bot_count"])
+        ok   = await deploy_to_node(best["url"], bot_key, bot_dir, owner_id)
+        if ok:
+            reg[bot_key]["node"] = best["url"]; best["bot_count"] += 1
+            save_registry(reg)
+            _do_stop(bot_key)   # terminates child process → frees local RAM
+            moved += 1
+            log.info("RAM-OFFLOAD %s → %s (mem was %.1f%%)", bot_key, best["url"], pct)
+            await _notify(owner_id,
+                f"⚡ *Auto-Offload (RAM saver)*\n\n"
+                f"*{display_name(bot_key)}* was moved to a worker node so the "
+                f"main server doesn't run out of memory.\n\n"
+                f"_Your bot keeps running automatically._")
+            await asyncio.sleep(2)   # let the killed process release memory
+            if moved >= MEM_MAX_MOVE:
+                break
+    if moved:
+        push_to_github("RAM auto-offload")
+    return moved
+
+
+async def memory_guard_loop():
+    """Background: sample memory; offload to nodes before OOM kills us."""
+    await asyncio.sleep(45)
+    alerted = False
+    while True:
+        try:
+            pct = get_mem_percent()
+            if pct >= MEM_HIGH_PCT:
+                log.warning("RAM GUARD: %.1f%% used — trying to offload", pct)
+                moved = await offload_bots_for_memory(pct)
+                if moved == 0 and pct >= MEM_CRIT_PCT and not alerted:
+                    alerted = True
+                    for aid in ADMIN_IDS:
+                        try:
+                            await _APP.bot.send_message(aid,
+                                f"🔴 *High RAM* `{pct:.0f}%` and no free worker node "
+                                f"to offload to.\n\nAdd a node with "
+                                f"`/addnode <url> <secret>` to prevent a shutdown.",
+                                parse_mode="Markdown")
+                        except Exception: pass
+            elif pct < MEM_EASE_PCT:
+                alerted = False
+        except Exception as e:
+            log.warning("Memory guard error: %s", e)
+        await asyncio.sleep(MEM_CHECK_SEC)
+
+
+async def cmd_ram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /ram — show current memory usage + offload thresholds."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    pct = get_mem_percent()
+    bar_n = int(pct / 10)
+    bar = "█" * bar_n + "░" * (10 - bar_n)
+    state = ("🔴 Critical" if pct >= MEM_CRIT_PCT else
+             "🟠 Offloading" if pct >= MEM_HIGH_PCT else
+             "🟢 Healthy")
+    await update.message.reply_text(
+        f"🧠 *Memory*\n\n`{bar}` *{pct:.1f}%*\n{state}\n\n"
+        f"🤖 Local bots: `{len(RUNNING_BOTS)}`\n"
+        f"🌐 Worker nodes: `{len(load_nodes())}`\n\n"
+        f"_Offload above {MEM_HIGH_PCT:.0f}% · ease at {MEM_EASE_PCT:.0f}%_",
+        parse_mode="Markdown")
 
 
 async def cmd_migratenodes(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1133,10 +1296,11 @@ async def _finalize(bot_key:str, bot_dir:Path, uid:int, msg, code_text=""):
     code=code_text or (bot_dir/"main.py").read_text(errors="replace")
     req=bot_dir/"requirements.txt"
     if req.exists():
-        await msg.edit_text("⚙️ Installing requirements…",parse_mode="Markdown"); _install_reqs(req)
+        await msg.edit_text("⚙️ Installing requirements…",parse_mode="Markdown")
+        await asyncio.to_thread(_install_reqs, req)
     else:
         await msg.edit_text("🔍 Auto-detecting packages…",parse_mode="Markdown")
-        installed=smart_install(code)
+        installed=await asyncio.to_thread(smart_install, code)
         if installed: log.info("Auto-installed: %s",installed)
 
     if bot_key in RUNNING_BOTS: _do_stop(bot_key); await asyncio.sleep(2)
@@ -1658,7 +1822,7 @@ async def autostart():
         if not item.is_dir() or item.name.startswith(("_",".")): continue
         if not (item/"main.py").exists(): continue
         req=item/"requirements.txt"
-        if req.exists(): _install_reqs(req)
+        if req.exists(): await asyncio.to_thread(_install_reqs, req)
         owner=reg.get(item.name,{}).get("owner_id",0)
         bots_to_start.append((item.name, item, owner))
 
@@ -1686,7 +1850,9 @@ async def main():
     DELETED_DIR.mkdir(parents=True, exist_ok=True)
     load_usernames()
 
-    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS)
+    # Pass run_bot so the Web IDE's ▶ Run can actually START a stopped /
+    # newly-created bot (not just flag a restart on an already-looping one).
+    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot)
 
     _APP = (
         ApplicationBuilder()
@@ -1723,6 +1889,7 @@ async def main():
         CommandHandler("unban",       cmd_unban),
         # Node management (admin only)
         CommandHandler("nodes",       cmd_nodes),
+        CommandHandler("ram",         cmd_ram),
         CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
         CommandHandler("removenode",  cmd_removenode),
@@ -1739,6 +1906,7 @@ async def main():
     await start_web_server()
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(node_health_monitor())   # auto-failover
+    asyncio.create_task(memory_guard_loop())     # RAM-based auto-offload
     await autostart()   # staggered!
 
     log.info("Clearing webhook…")
@@ -1766,6 +1934,7 @@ async def main():
             BotCommand("all",         "👑 All bots"),
             BotCommand("users",       "👑 All users"),
             BotCommand("nodes",       "👑 Worker nodes"),
+            BotCommand("ram",         "👑 Memory usage"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
             BotCommand("msg",         "👑 Broadcast"),
