@@ -64,6 +64,10 @@ RENDER_URL      = os.environ.get("RENDER_URL",      "").rstrip("/")
 PORT            = int(os.environ.get("PORT",         8080))
 NODE_SECRET     = os.environ.get("NODE_SECRET",     "")   # shared secret with workers
 IS_WORKER       = os.environ.get("IS_WORKER",        "false").lower() == "true"
+# Boot behaviour: by default DO NOT auto-start hosted bots (starting them all
+# at once fills RAM and OOM-crashes Render before a node can be added).
+# Admin starts them gradually with /st instead. Set AUTOSTART=true to revert.
+AUTOSTART       = os.environ.get("AUTOSTART",        "false").lower() == "true"
 
 if not BOT_TOKEN:
     log.critical("BOT_TOKEN not set — aborting."); sys.exit(1)
@@ -1676,6 +1680,7 @@ async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         nodes=load_nodes()
         await update.message.reply_text(
             f"👑 *Admin*\n\n🤖`{total}` 🟢`{running}` 👥`{len(load_users())}` 🌐`{len(nodes)}`\n\n"
+            f"▶️ `/st` start idle bots · 🧠 `/ram`\n"
             f"`/all` `/users` `/user <id>` `/msg`\n"
             f"`/pr <id> <slots>` `/ban` `/unban`\n"
             f"`/nodes` `/addnode <url> <secret>` `/removenode <url>`",parse_mode="Markdown"); return
@@ -1784,6 +1789,7 @@ async def handle_callback(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         total=len(RUNNING_BOTS); running=sum(1 for e in RUNNING_BOTS.values() if e.get("status")=="Running 🟢")
         await q.edit_message_text(
             f"👑 *Admin*\n\n🤖`{total}` 🟢`{running}` 👥`{len(load_users())}` 🌐`{len(load_nodes())}`\n\n"
+            f"▶️ `/st` start idle bots · 🧠 `/ram`\n"
             f"`/all` `/users` `/user <id>` `/msg`\n`/nodes` `/addnode` `/removenode`\n`/pr` `/ban` `/unban`",
             parse_mode="Markdown",reply_markup=kb_back())
 
@@ -1832,6 +1838,124 @@ async def autostart():
         asyncio.create_task(run_bot(bot_key, bot_dir, owner, stagger=True))
         # Small initial delay so tasks don't all hit semaphore at exactly the same time
         await asyncio.sleep(0.1)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MANUAL GRADUAL START  —  /st
+#  Starts idle bots ONE-BY-ONE with a time gap. As local RAM fills (or if
+#  worker nodes exist) the remaining bots are pushed to the least-loaded
+#  node, distributing across however many nodes are connected. This avoids
+#  the boot-time RAM spike that OOM-crashed the whole service.
+# ══════════════════════════════════════════════════════════════════════
+
+_st_running = False   # guard against two /st runs at once
+
+
+def _list_idle_bots() -> list[tuple[str, Path, int]]:
+    """On-disk bots with a main.py that are NOT currently running locally."""
+    reg = load_registry()
+    out = []
+    if not HOSTED_DIR.exists(): return out
+    for item in sorted(HOSTED_DIR.iterdir()):
+        if not item.is_dir() or item.name.startswith(("_", ".")): continue
+        if not (item / "main.py").exists(): continue
+        e = RUNNING_BOTS.get(item.name)
+        if e and e.get("active"): continue          # already running here
+        owner = reg.get(item.name, {}).get("owner_id", 0)
+        out.append((item.name, item, owner))
+    return out
+
+
+def _count_idle_bots() -> int:
+    return len(_list_idle_bots())
+
+
+async def pick_live_node() -> str | None:
+    """URL of the least-loaded ONLINE worker node, or None if none available."""
+    statuses = await all_node_statuses()
+    online   = [s for s in statuses if s["online"] and s["enabled"]]
+    if not online: return None
+    return min(online, key=lambda s: s["bot_count"])["url"]
+
+
+async def cmd_st(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /st — start all idle bots gradually (RAM-safe, node-aware)."""
+    global _st_running
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    if _st_running:
+        await update.message.reply_text("⏳ A start run is already in progress."); return
+
+    bots = _list_idle_bots()
+    if not bots:
+        await update.message.reply_text("✅ No idle bots — everything is already running."); return
+
+    _st_running = True
+    local = node = failed = 0
+    sm = await update.message.reply_text(
+        f"▶️ Starting *{len(bots)}* bot(s) one-by-one (gap `{STARTUP_DELAY_SEC}s`)…\n"
+        f"_RAM-safe · auto-routes to nodes when memory fills._",
+        parse_mode="Markdown")
+    try:
+        node_pool = bool(load_nodes())
+        for i, (bot_key, bot_dir, owner) in enumerate(bots, 1):
+            # Skip if it somehow started in the meantime
+            e = RUNNING_BOTS.get(bot_key)
+            if e and e.get("active"):
+                continue
+
+            pct = get_mem_percent()
+            # Route to a worker node when RAM is high (or threshold reached).
+            target_node = await pick_live_node() if pct >= MEM_HIGH_PCT else None
+
+            placed = "local"
+            if target_node:
+                ok = await deploy_to_node(target_node, bot_key, bot_dir, owner)
+                if ok:
+                    placed = target_node; node += 1
+                else:
+                    target_node = None   # fall back to local below
+
+            if not target_node:
+                # Install this bot's own requirements off the loop, then run it.
+                req = bot_dir / "requirements.txt"
+                if req.exists():
+                    await asyncio.to_thread(_install_reqs, req)
+                asyncio.create_task(run_bot(bot_key, bot_dir, owner, stagger=False))
+                local += 1
+
+            # Persist placement
+            reg = load_registry()
+            if bot_key in reg:
+                reg[bot_key]["node"] = placed; save_registry(reg)
+            else:
+                register_bot(bot_key, owner, placed)
+
+            # Live progress (every bot — safe, we wait STARTUP_DELAY_SEC between)
+            try:
+                await sm.edit_text(
+                    f"▶️ *Starting bots…*  `{i}/{len(bots)}`\n\n"
+                    f"🧠 RAM: `{pct:.0f}%`\n"
+                    f"📍 Local: `{local}`   🌐 Node: `{node}`   ❌ `{failed}`\n"
+                    f"🔹 Last: *{display_name(bot_key)}* → "
+                    f"`{'local' if placed=='local' else placed.split('//')[-1][:22]}`",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+            if i < len(bots):
+                await asyncio.sleep(STARTUP_DELAY_SEC)
+
+        push_to_github("/st gradual start")
+        await sm.edit_text(
+            f"✅ *Start complete!*\n\n"
+            f"📍 Local: `{local}`\n🌐 On nodes: `{node}`\n❌ Failed: `{failed}`\n\n"
+            f"🧠 RAM now: `{get_mem_percent():.0f}%`\n"
+            f"_RAM guard keeps offloading if memory climbs._",
+            parse_mode="Markdown")
+    finally:
+        _st_running = False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1890,6 +2014,7 @@ async def main():
         # Node management (admin only)
         CommandHandler("nodes",       cmd_nodes),
         CommandHandler("ram",         cmd_ram),
+        CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
         CommandHandler("removenode",  cmd_removenode),
@@ -1907,7 +2032,11 @@ async def main():
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(node_health_monitor())   # auto-failover
     asyncio.create_task(memory_guard_loop())     # RAM-based auto-offload
-    await autostart()   # staggered!
+    if AUTOSTART:
+        await autostart()   # staggered (opt-in via AUTOSTART=true)
+    else:
+        log.info("Autostart OFF — %d bot(s) idle. Admin: /st to start gradually.",
+                 _count_idle_bots())
 
     log.info("Clearing webhook…")
     await _APP.bot.delete_webhook(drop_pending_updates=True)
@@ -1933,6 +2062,7 @@ async def main():
             BotCommand("rotatetoken", "🔐 New IDE token"),
             BotCommand("all",         "👑 All bots"),
             BotCommand("users",       "👑 All users"),
+            BotCommand("st",          "👑 Start idle bots gradually"),
             BotCommand("nodes",       "👑 Worker nodes"),
             BotCommand("ram",         "👑 Memory usage"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
@@ -1943,6 +2073,22 @@ async def main():
     except Exception: pass
 
     log.info("✅ v4.3 live! Stagger=%ds  IDE: %s/editor", STARTUP_DELAY_SEC, RENDER_URL or "localhost:"+str(PORT))
+
+    # Now that the bot is fully started, nudge admins if bots are idle.
+    if not AUTOSTART:
+        idle = _count_idle_bots()
+        if idle:
+            for aid in ADMIN_IDS:
+                try:
+                    await _APP.bot.send_message(aid,
+                        f"🟢 *Master online* (low RAM — no bots auto-started).\n\n"
+                        f"💤 `{idle}` hosted bot(s) are idle.\n"
+                        f"▶️ Send /st to start them *one-by-one* (RAM-safe).\n"
+                        f"🌐 Tip: add worker nodes with `/addnode` first so they "
+                        f"spread across nodes as RAM fills.",
+                        parse_mode="Markdown")
+                except Exception: pass
+
     await asyncio.Event().wait()
 
 
