@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+hosted_bots/
+.env
