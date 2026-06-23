@@ -1417,18 +1417,47 @@ async def cmd_addnode(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
+def reassign_node_bots_to_local(node_url: str) -> list[str]:
+    """Point any bots registered to node_url back to 'local' so they can be
+    (re)started here. Returns the affected bot_keys."""
+    node_url = node_url.rstrip("/")
+    reg = load_registry(); moved = []
+    for k, v in reg.items():
+        if str(v.get("node", "")).rstrip("/") == node_url:
+            reg[k]["node"] = "local"; moved.append(k)
+    if moved: save_registry(reg)
+    return moved
+
+
+async def _recover_local(bot_keys: list[str]):
+    """Gradually (RAM-safe) start the given bots locally if not already running."""
+    for k in bot_keys:
+        d = HOSTED_DIR / k
+        if not (d / "main.py").exists(): continue
+        e = RUNNING_BOTS.get(k)
+        if e and e.get("active"): continue
+        owner = load_registry().get(k, {}).get("owner_id", 0)
+        asyncio.create_task(run_bot(k, d, owner, stagger=False))
+        await asyncio.sleep(STARTUP_DELAY_SEC)
+
+
 async def cmd_removenode(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     """Admin: /removenode <url>"""
     uid=update.effective_user.id
     if not is_admin(uid): return
     try: node_url=ctx.args[0].rstrip("/")
     except: await update.message.reply_text("Usage: `/removenode <url>`",parse_mode="Markdown"); return
-    remove_node(node_url); push_to_github(f"Removed node: {node_url}")
-    await update.message.reply_text(f"🗑 Node `{node_url}` removed.",parse_mode="Markdown")
+    remove_node(node_url)
+    moved=reassign_node_bots_to_local(node_url)
+    push_to_github(f"Removed node: {node_url}")
+    extra=(f"\n\n🔁 `{len(moved)}` bot(s) re-assigned to *local*. "
+           f"Run /st to start them." if moved else "")
+    await update.message.reply_text(
+        f"🗑 Node `{node_url}` removed.{extra}",parse_mode="Markdown")
 
 
 async def cmd_nodes(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """Admin: show all worker nodes + their status."""
+    """Admin: show all worker nodes + their status, with delete buttons."""
     uid=update.effective_user.id
     if not is_admin(uid): await update.message.reply_text("❌ Admin only."); return
     nodes=load_nodes()
@@ -1441,11 +1470,18 @@ async def cmd_nodes(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     local_bots=len(RUNNING_BOTS)
     lines=[f"🌐 *Worker Nodes* ({len(nodes)} registered)\n",
            f"📍 *Local (this server)*\n   🟢 Running · `{local_bots}` bots\n"]
-    for s in statuses:
-        url=s["url"]; short=url.split("//")[1][:30] if "//" in url else url
-        status="🟢 Online" if s["online"] else "🔴 Offline"
-        lines.append(f"🌐 `{short}`\n   {status} · `{s['bot_count']}` bots\n")
-    await sm.edit_text("\n".join(lines),parse_mode="Markdown")
+    rows=[]
+    node_urls=list(nodes.keys())   # stable order matching button indices
+    for i, url in enumerate(node_urls):
+        s=next((x for x in statuses if x["url"]==url), {"online":False,"bot_count":0})
+        short=url.split("//")[1][:30] if "//" in url else url
+        status="🟢 Online" if s.get("online") else "🔴 Offline"
+        lines.append(f"🌐 `{short}`\n   {status} · `{s.get('bot_count',0)}` bots\n")
+        rows.append([InlineKeyboardButton(f"🗑 Delete  {short[:24]}",
+                                          callback_data=f"delnode|{i}")])
+    rows.append([InlineKeyboardButton("🔄 Refresh",callback_data="nodes_refresh")])
+    await sm.edit_text("\n".join(lines),parse_mode="Markdown",
+                       reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cmd_mybots(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -1711,6 +1747,38 @@ async def handle_callback(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): await q.answer("❌ Admin only!",show_alert=True); return
         parts=d.split("|"); web_ide._block_ip(parts[2] if len(parts)>2 else ""); web_ide._PENDING[parts[1]]="block"
         await q.edit_message_text(f"🚫 Blocked.",parse_mode="Markdown"); return
+
+    if d.startswith("delnode|"):
+        if not is_admin(uid): await q.answer("❌ Admin only!",show_alert=True); return
+        try: idx=int(d.split("|",1)[1])
+        except: await q.answer("Bad index.",show_alert=True); return
+        node_urls=list(load_nodes().keys())
+        if idx<0 or idx>=len(node_urls): await q.answer("Node gone — refresh.",show_alert=True); return
+        node_url=node_urls[idx]
+        remove_node(node_url); moved=reassign_node_bots_to_local(node_url)
+        push_to_github(f"Removed node: {node_url}")
+        if moved: asyncio.create_task(_recover_local(moved))
+        short=node_url.split("//")[1][:30] if "//" in node_url else node_url
+        extra=f"\n🔁 `{len(moved)}` bot(s) moved to local & starting…" if moved else ""
+        await q.edit_message_text(f"🗑 Node `{short}` deleted.{extra}",
+            parse_mode="Markdown",reply_markup=kb_back()); return
+    if d=="nodes_refresh":
+        if not is_admin(uid): await q.answer("❌ Admin only!",show_alert=True); return
+        statuses=await all_node_statuses(); nodes=load_nodes()
+        if not nodes:
+            await q.edit_message_text("📭 No worker nodes registered.",parse_mode="Markdown"); return
+        lines=[f"🌐 *Worker Nodes* ({len(nodes)} registered)\n",
+               f"📍 *Local (this server)*\n   🟢 Running · `{len(RUNNING_BOTS)}` bots\n"]
+        rows=[]
+        for i,url in enumerate(load_nodes().keys()):
+            s=next((x for x in statuses if x["url"]==url),{"online":False,"bot_count":0})
+            short=url.split("//")[1][:30] if "//" in url else url
+            st="🟢 Online" if s.get("online") else "🔴 Offline"
+            lines.append(f"🌐 `{short}`\n   {st} · `{s.get('bot_count',0)}` bots\n")
+            rows.append([InlineKeyboardButton(f"🗑 Delete  {short[:24]}",callback_data=f"delnode|{i}")])
+        rows.append([InlineKeyboardButton("🔄 Refresh",callback_data="nodes_refresh")])
+        await q.edit_message_text("\n".join(lines),parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows)); return
 
     if d=="main_menu":
         await q.edit_message_text(home_text(uid),parse_mode="Markdown",reply_markup=kb_home(is_admin(uid)))
@@ -1981,10 +2049,14 @@ async def main():
         .token(BOT_TOKEN)
         # ── Speed & concurrency ───────────────────────────────────────
         .concurrent_updates(True)          # handle multiple updates in parallel
+        # Big HTTP connection pool so replies actually go out in PARALLEL.
+        # With the default tiny pool, concurrent_updates still serialises on
+        # the connection — this is the real "instant reply under load" fix.
+        .connection_pool_size(256)
         .read_timeout(10)                  # faster timeout (default 5)
         .write_timeout(10)
         .connect_timeout(10)
-        .pool_timeout(5)
+        .pool_timeout(8)
         .get_updates_read_timeout(42)      # long-poll: keep connection open
         .get_updates_write_timeout(15)
         .get_updates_connect_timeout(15)
