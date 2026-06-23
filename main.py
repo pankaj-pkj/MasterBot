@@ -606,24 +606,22 @@ def push_to_github(msg="Update"):
 # ══════════════════════════════════════════════════════════════════════
 
 async def _web_root(req: web.Request) -> web.Response:
-    ide  = f"{RENDER_URL}/editor" if RENDER_URL else "/editor"
-    rows = "".join(
-        f"<tr><td><b>{display_name(n)}</b></td><td>{d.get('status','?')}</td>"
-        f"<td>{fmt_up(time.time()-d.get('start_time',time.time()))}</td>"
-        f"<td>{d.get('restarts',0)}</td></tr>"
-        for n, d in RUNNING_BOTS.items()
-    )
+    # SECURITY: never list users' bots publicly. This page is reachable by
+    # anyone, so it must not leak bot names, counts, status or uptime.
+    ide = f"{RENDER_URL}/editor" if RENDER_URL else "/editor"
     return web.Response(content_type="text/html", text=(
-        "<html><head><title>Master Hosting Bot v4.1</title>"
-        "<style>body{font-family:monospace;padding:20px;background:#1e1e1e;color:#d4d4d4}"
-        "h2{color:#4fc3f7}.btn{display:inline-block;background:#0e639c;color:#fff;"
-        "padding:8px 20px;border-radius:4px;text-decoration:none;margin:12px 0}"
-        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #3c3c3c;padding:8px}"
-        "tr:nth-child(even){background:#252526}</style></head><body>"
-        f"<h2>🤖 Master Hosting Bot v4.1</h2>"
-        f"<a class='btn' href='{ide}'>💎 Web IDE</a><br><br>"
-        f"<table><tr><th>Bot</th><th>Status</th><th>Uptime</th><th>Restarts</th></tr>"
-        f"{rows}</table><p style='color:#555;margin-top:14px'><i>Codian Studio 💎</i></p></body></html>"
+        "<html><head><title>Codian Studio</title>"
+        "<meta name='robots' content='noindex,nofollow'>"
+        "<style>body{font-family:system-ui,sans-serif;padding:40px;background:#0d1117;"
+        "color:#e6edf3;text-align:center}h2{color:#58a6ff}"
+        ".btn{display:inline-block;background:#238636;color:#fff;padding:10px 22px;"
+        "border-radius:6px;text-decoration:none;margin:18px 0;font-weight:600}"
+        "p{color:#8b949e}</style></head><body>"
+        "<h2>💎 Codian Studio</h2>"
+        "<p>Private bot hosting. Sign in with your access token.</p>"
+        f"<a class='btn' href='{ide}'>Open Web IDE →</a>"
+        "<p style='font-size:12px;margin-top:24px'>Get your token from the bot: <code>/ide</code></p>"
+        "</body></html>"
     ))
 
 def _check_node_secret(req: web.Request) -> bool:

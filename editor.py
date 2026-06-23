@@ -228,9 +228,10 @@ async def api_upload(req):
         async for part in reader:
             if part.name=="dir": dest_raw=(await part.read()).decode().strip()
             elif part.filename:
+                # Uploads MUST target a bot the user owns — never the root.
                 bot=dest_raw.split("/")[0] if dest_raw else ""
-                if bot and not _can(uid,ia,bot): continue
-                dest=_sp(dest_raw) if dest_raw else HOSTED_DIR
+                if not bot or not _can(uid,ia,bot): continue
+                dest=_sp(dest_raw)
                 if not dest: continue
                 dest.mkdir(parents=True,exist_ok=True)
                 fname=Path(part.filename).name
@@ -335,7 +336,10 @@ async def api_logs(req):
                               "uptime":_fup(time.time()-e["start_time"]) if e.get("start_time") else "—"})
 
 async def ws_logs(req):
-    tok=req.rel_url.query.get("token",""); bot=req.rel_url.query.get("bot","")
+    # Token may come from the query OR the httponly cookie (browsers send the
+    # cookie on the WS handshake). Cookie-first keeps the token out of URLs/logs.
+    tok=req.rel_url.query.get("token") or req.cookies.get("ide_token","")
+    bot=req.rel_url.query.get("bot","")
     uid=_lj(_TOKENS_FILE,{}).get(tok,0)
     if not uid: raise web.HTTPUnauthorized()
     if not _can(uid,uid in _ADMIN_IDS,bot): raise web.HTTPForbidden()
