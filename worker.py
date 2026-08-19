@@ -41,6 +41,31 @@ logging.basicConfig(
 log = logging.getLogger("Worker")
 
 # ── ENV ───────────────────────────────────────────────────────────────
+
+def _load_dotenv(path: Path = None):
+    """Load .env next to this script. Real env vars always take priority."""
+    path = path or (Path(__file__).resolve().parent / ".env")
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip().lstrip("﻿")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if not key or key in os.environ:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        os.environ[key] = val
+
+_load_dotenv()
+
 NODE_SECRET = os.environ.get("NODE_SECRET", "")
 RENDER_URL  = os.environ.get("RENDER_URL", "").rstrip("/")
 PORT        = int(os.environ.get("PORT", 8080))

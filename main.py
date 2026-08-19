@@ -56,6 +56,39 @@ log = logging.getLogger("MasterBot")
 # ══════════════════════════════════════════════════════════════════════
 #  ENV CONFIG
 # ══════════════════════════════════════════════════════════════════════
+
+def _load_dotenv(path: Path = None):
+    """
+    Load KEY=VALUE pairs from a .env file next to this script.
+
+    Real environment variables ALWAYS win, so this never overrides what
+    systemd/Docker/the shell already provided — it only fills the gaps.
+    Without this, running `python main.py` by hand (or any setup where
+    systemd's EnvironmentFile isn't parsed) sees no BOT_TOKEN and aborts,
+    even though .env is sitting right there.
+    """
+    path = path or (Path(__file__).resolve().parent / ".env")
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip().lstrip("﻿")          # tolerate a BOM
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):                  # tolerate `export K=V`
+            key = key[7:].strip()
+        if not key or key in os.environ:               # never override real env
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]                            # strip matching quotes
+        os.environ[key] = val
+
+_load_dotenv()
+
 BOT_TOKEN       = os.environ.get("BOT_TOKEN",       "")
 GITHUB_PAT      = os.environ.get("GITHUB_PAT",      "")
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "")
@@ -70,7 +103,25 @@ IS_WORKER       = os.environ.get("IS_WORKER",        "false").lower() == "true"
 AUTOSTART       = os.environ.get("AUTOSTART",        "false").lower() == "true"
 
 if not BOT_TOKEN:
-    log.critical("BOT_TOKEN not set — aborting."); sys.exit(1)
+    _envf = Path(__file__).resolve().parent / ".env"
+    log.critical("BOT_TOKEN not set — aborting.")
+    if not _envf.exists():
+        log.critical("  No .env file at %s", _envf)
+        log.critical("  Create it:  echo 'BOT_TOKEN=your_token' > %s", _envf)
+    else:
+        keys = []
+        try:
+            for ln in _envf.read_text(errors="replace").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    keys.append(ln.split("=", 1)[0].strip())
+        except OSError:
+            pass
+        log.critical("  .env found at %s", _envf)
+        log.critical("  Keys it defines: %s", ", ".join(keys) or "(none)")
+        log.critical("  Make sure a line reads exactly:  BOT_TOKEN=123456:ABC...")
+        log.critical("  (no spaces around '=', no quotes needed)")
+    sys.exit(1)
 
 # ══════════════════════════════════════════════════════════════════════
 #  CONSTANTS
