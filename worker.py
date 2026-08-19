@@ -417,5 +417,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    try:
+        import uvloop
+        uvloop.install()
+        log.info("⚡ uvloop active — faster event loop")
+    except ImportError:
+        log.info("uvloop not installed — using default asyncio loop")
     try: asyncio.run(main())
     except KeyboardInterrupt: log.info("Worker stopped.")

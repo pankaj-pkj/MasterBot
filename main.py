@@ -2163,6 +2163,17 @@ async def main():
 
 
 if __name__ == "__main__":
+    # SPEED: uvloop replaces asyncio's default event loop with a much faster
+    # (libuv-based) one — real win for async-heavy code like this (Telegram
+    # polling + many concurrent child-bot subprocess supervision). Optional:
+    # falls back cleanly if uvloop isn't installed (e.g. non-Linux hosts).
+    try:
+        import uvloop
+        uvloop.install()
+        log.info("⚡ uvloop active — faster event loop")
+    except ImportError:
+        log.info("uvloop not installed — using default asyncio loop "
+                 "(pip install uvloop for a speed boost on Linux)")
     try: asyncio.run(main())
     except KeyboardInterrupt: log.info("Stopped.")
 
