@@ -220,6 +220,37 @@ async def api_mkdir(req):
         return web.json_response({"ok":True})
     except Exception as ex: return web.json_response({"error":str(ex)},status=500)
 
+async def api_rename(req):
+    uid,ia=_auth(req)
+    if not uid: return web.json_response({"error":"unauthorized"},status=401)
+    try:
+        body=await req.json()
+        src_raw=body.get("path",""); new_name=(body.get("name","") or "").strip()
+        if not src_raw or not new_name:
+            return web.json_response({"error":"path and name required"},status=400)
+        # New name must be a bare filename — no traversal, no moving between bots
+        if "/" in new_name or "\\" in new_name or new_name in (".",".."):
+            return web.json_response({"error":"Invalid name"},status=400)
+        bot=src_raw.split("/")[0]
+        if not _can(uid,ia,bot): return web.json_response({"error":"forbidden"},status=403)
+        src=_sp(src_raw)
+        if not src or not src.exists():
+            return web.json_response({"error":"Not found"},status=404)
+        # Renaming a bot's top-level folder would break the registry
+        if src.parent.resolve()==HOSTED_DIR.resolve():
+            return web.json_response({"error":"Can't rename a bot folder here."},status=400)
+        # src is already confirmed inside HOSTED_DIR and new_name has no
+        # separators, so dst cannot escape — but re-verify to be safe.
+        dst=(src.parent/new_name).resolve()
+        base=HOSTED_DIR.resolve()
+        if base not in dst.parents:
+            return web.json_response({"error":"Invalid path"},status=400)
+        if dst.exists(): return web.json_response({"error":f"'{new_name}' exists"},status=409)
+        src.rename(dst)
+        return web.json_response({"ok":True,
+            "path":dst.relative_to(base).as_posix(),"name":new_name})
+    except Exception as ex: return web.json_response({"error":str(ex)},status=500)
+
 async def api_upload(req):
     uid,ia=_auth(req)
     if not uid: return web.json_response({"error":"unauthorized"},status=401)
@@ -386,6 +417,7 @@ def register_routes(app):
     app.router.add_post("/editor/api/file",   api_write)
     app.router.add_post("/editor/api/delete", api_delete)
     app.router.add_post("/editor/api/mkdir",  api_mkdir)
+    app.router.add_post("/editor/api/rename", api_rename)
     app.router.add_post("/editor/api/upload", api_upload)
     app.router.add_post("/editor/api/newbot", api_newbot)
     app.router.add_post("/editor/api/run",    api_run)
@@ -732,6 +764,10 @@ body{height:100svh;overflow:hidden;touch-action:none}
   <input id="nd-n" placeholder="folder-name" autocorrect="off" autocapitalize="off">
   <div class="mbtns"><button class="mcancel" onclick="cM('m-nd')">Cancel</button>
     <button class="mok" onclick="doND()">Create</button></div></div></div>
+<div class="mov" id="m-rn"><div class="modal"><h3>✏️ Rename</h3>
+  <input id="rn-n" placeholder="new-name.py" autocorrect="off" autocapitalize="off">
+  <div class="mbtns"><button class="mcancel" onclick="cM('m-rn')">Cancel</button>
+    <button class="mok" onclick="doRN()">Rename</button></div></div></div>
 <div class="mov" id="m-ul"><div class="modal"><h3>⬆️ Upload Files</h3>
   <p style="color:var(--tx2);font-size:12px;margin-bottom:12px">To: <b id="ul-d" style="color:var(--tx)">/</b></p>
   <button class="mok" style="width:100%;margin-bottom:10px"
@@ -787,6 +823,8 @@ body{height:100svh;overflow:hidden;touch-action:none}
           <button class="ib" onclick="rf()" title="Refresh">⟳</button>
           <button class="ib" id="sb-nf" style="display:none" onclick="oM('m-nf')" title="New File">📄</button>
           <button class="ib" id="sb-nd" style="display:none" onclick="oM('m-nd')" title="New Folder">📁</button>
+          <button class="ib" id="sb-rn" style="display:none" onclick="askRename()" title="Rename selected">✏️</button>
+          <button class="ib" id="sb-del" style="display:none" onclick="delFile()" title="Delete selected">🗑</button>
         </div>
       </div>
       <div id="tree">
@@ -1071,6 +1109,7 @@ function actTab(tab){
   }
   curFile=tab.path;
   if(!curBot&&tab.bot) selBot(tab.bot,tab.bot);
+  updFileBtns();
   renderTabs();
 }
 
@@ -1084,6 +1123,7 @@ function cTab(path,e){
     else{
       if(ed) ed.setModel(null);
       document.getElementById('welcome').classList.remove('hide');
+      curFile=''; updFileBtns();
     }
   }
   renderTabs();
@@ -1183,12 +1223,43 @@ async function doND(){
   toast('📁 Created','ok'); rf();
 }
 async function delFile(){
-  if(!curFile){toast('No file selected','err');return;}
+  if(!curFile){toast('Select a file first','err');return;}
   if(!confirm('Delete '+curFile+'?')) return;
   const r=await api('/editor/api/delete',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({path:curFile})});
   if(r.error){toast('❌ '+r.error,'err');return;}
-  cTab(curFile,null); curFile=''; toast('🗑 Deleted','ok'); rf();
+  cTab(curFile,null); curFile=''; updFileBtns(); toast('🗑 Deleted','ok'); rf();
+}
+
+// ── RENAME ────────────────────────────────────────────────────────────
+function askRename(){
+  if(!curFile){toast('Select a file first','err');return;}
+  oM('m-rn');
+  const inp=document.getElementById('rn-n');
+  inp.value=curFile.split('/').pop();
+  setTimeout(()=>{inp.focus();inp.select();},60);
+}
+async function doRN(){
+  const n=document.getElementById('rn-n').value.trim();
+  if(!n||!curFile) return;
+  const old=curFile;
+  const r=await api('/editor/api/rename',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({path:old,name:n})});
+  cM('m-rn');
+  if(r.error){toast('❌ '+r.error,'err');return;}
+  // Re-point any open tab at the new path
+  const tab=tabs.find(t=>t.path===old&&t.type==='f');
+  if(tab){tab.path=r.path;tab.name=r.name;}
+  curFile=r.path; renderTabs(); toast('✏️ Renamed to '+r.name,'ok'); rf();
+}
+
+// Show rename/delete only when a file is actually selected
+function updFileBtns(){
+  const on=!!curFile;
+  const rn=document.getElementById('sb-rn'), dl=document.getElementById('sb-del');
+  if(rn) rn.style.display=on?'':'none';
+  if(dl) dl.style.display=on?'':'none';
 }
 
 // ── UPLOAD ────────────────────────────────────────────────────────────
@@ -1391,6 +1462,7 @@ document.querySelectorAll('.mov').forEach(bg=>{
 document.getElementById('nb-n').addEventListener('keydown',e=>e.key==='Enter'&&doNB());
 document.getElementById('nf-n').addEventListener('keydown',e=>e.key==='Enter'&&doNF());
 document.getElementById('nd-n').addEventListener('keydown',e=>e.key==='Enter'&&doND());
+document.getElementById('rn-n').addEventListener('keydown',e=>e.key==='Enter'&&doRN());
 
 // ── TOAST ─────────────────────────────────────────────────────────────
 let _tt;

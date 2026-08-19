@@ -1,0 +1,40 @@
+# ────────────────────────────────────────────────────────────────────
+#  Caddy reverse proxy — Master Hosting Bot
+#
+#  Replace bot.codianstudio.org with your subdomain if different.
+#  Caddy gets a free Let's Encrypt certificate automatically and renews
+#  it forever — no certbot, no cron job, no manual steps.
+#
+#  Install:
+#    sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#    sudo sed -i "s/bot.codianstudio.org/YOUR.SUBDOMAIN/" /etc/caddy/Caddyfile
+#    sudo systemctl reload caddy
+# ────────────────────────────────────────────────────────────────────
+
+bot.codianstudio.org {
+	# Everything goes to the bot's aiohttp server on localhost:8080.
+	# The IDE's WebSocket log stream (/editor/ws) is upgraded correctly
+	# by reverse_proxy without extra config.
+	reverse_proxy localhost:8080
+
+	encode gzip
+
+	header {
+		# Don't advertise the stack
+		-Server
+		# Force HTTPS for a year (Caddy already redirects http->https)
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Basic hardening for the IDE page
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+	}
+
+	# Keep the IDE out of search engines — bot code is private.
+	header /editor* X-Robots-Tag "noindex, nofollow"
+
+	# Uploads can be large (bot ZIPs). Match the aiohttp 512MB limit.
+	request_body {
+		max_size 512MB
+	}
+}
