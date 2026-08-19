@@ -1130,6 +1130,59 @@ async def cmd_setram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                     parse_mode="Markdown")
 
 
+def _dir_size_mb(p: Path) -> float:
+    """Total size of a directory tree in MB."""
+    total = 0
+    try:
+        for f in p.rglob("*"):
+            try:
+                if f.is_file(): total += f.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total / (1024 * 1024)
+
+
+async def cmd_disk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /disk — server storage + biggest bots by disk usage."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    sm = await update.message.reply_text("💾 Checking disk…")
+
+    def _gather():
+        st = shutil.disk_usage("/")
+        rows = []
+        if HOSTED_DIR.exists():
+            for d in HOSTED_DIR.iterdir():
+                if d.is_dir() and not d.name.startswith(("_", ".")):
+                    rows.append((d.name, _dir_size_mb(d)))
+        rows.sort(key=lambda kv: -kv[1])
+        return st, rows, _dir_size_mb(HOSTED_DIR) if HOSTED_DIR.exists() else 0.0
+
+    st, rows, hosted_mb = await asyncio.to_thread(_gather)
+    total_gb = st.total / (1024 ** 3)
+    used_gb  = st.used  / (1024 ** 3)
+    free_gb  = st.free  / (1024 ** 3)
+    pct      = st.used / st.total * 100 if st.total else 0
+    n        = min(int(pct / 10), 10)
+    bar      = "█" * n + "░" * (10 - n)
+
+    lines = [
+        "💾 *Server Storage*\n",
+        f"`{bar}` *{pct:.0f}%*",
+        f"Used `{used_gb:.1f}GB` / `{total_gb:.1f}GB`",
+        f"Free `{free_gb:.1f}GB`\n",
+        f"🤖 All bots: `{hosted_mb:.0f}MB`  ·  count `{len(rows)}`",
+    ]
+    if rows:
+        lines.append("\n*Biggest bots:*")
+        for name, mb in rows[:10]:
+            lines.append(f"  🔹 {display_name(name)} — `{mb:.1f}MB`")
+    await sm.edit_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_ram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin: /ram — show current memory usage + offload thresholds."""
     uid = update.effective_user.id
@@ -2349,6 +2402,7 @@ async def main():
         # Node management (admin only)
         CommandHandler("nodes",       cmd_nodes),
         CommandHandler("ram",         cmd_ram),
+        CommandHandler("disk",        cmd_disk),
         CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
@@ -2403,6 +2457,7 @@ async def main():
             BotCommand("st",          "👑 Start idle bots gradually"),
             BotCommand("nodes",       "👑 Worker nodes"),
             BotCommand("ram",         "👑 Memory usage"),
+            BotCommand("disk",        "👑 Disk usage"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
             BotCommand("msg",         "👑 Broadcast"),
