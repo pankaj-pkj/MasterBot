@@ -1,12 +1,17 @@
 # ────────────────────────────────────────────────────────────────────
 #  systemd unit — Master Hosting Bot
 #
-#  1. Edit the two placeholders below: __USER__ and the path if different.
-#  2. Install:
+#  Install (run install_service.sh — it fills the placeholders for you):
+#       ./deploy/install_service.sh
+#
+#  Or manually (note: root's home is /root, NOT /home/root):
 #       sudo cp deploy/masterbot.service /etc/systemd/system/
+#       sudo sed -i "s|__USER__|$USER|g; s|__DIR__|$PWD|g" \
+#            /etc/systemd/system/masterbot.service
 #       sudo systemctl daemon-reload
 #       sudo systemctl enable --now masterbot
-#  3. Logs:
+#
+#  Logs:
 #       journalctl -u masterbot -f
 # ────────────────────────────────────────────────────────────────────
 [Unit]
@@ -17,9 +22,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=__USER__
-WorkingDirectory=/home/__USER__/MasterBot
-EnvironmentFile=/home/__USER__/MasterBot/.env
-ExecStart=/home/__USER__/MasterBot/venv/bin/python main.py
+WorkingDirectory=__DIR__
+EnvironmentFile=__DIR__/.env
+ExecStart=__DIR__/venv/bin/python main.py
 Restart=always
 RestartSec=5
 # Don't let one runaway child bot subprocess take the whole host down.

@@ -67,11 +67,30 @@ Ab aap VPS ke andar ho. **Aage ke saare commands VPS ke andar chalenge.**
 
 ## STEP 4 — Bot install
 
+> ### ⚠️ Ek-ek command chalao, saath me paste mat karo
+> `git clone` beech me username/password maangta hai. Agar aapne saare
+> commands ek saath paste kar diye, to git aapke agle command ko hi
+> username samajh lega aur `403 / Authentication failed` dega.
+
+Repo private hai, isliye token chahiye (GitHub password kaam nahi karta).
+Token URL me daal do — tab koi prompt aayega hi nahi:
+
 ```bash
-git clone https://github.com/pankaj-pkj/MasterBot.git
+git clone https://pankaj-pkj:YOUR_TOKEN@github.com/pankaj-pkj/MasterBot.git
+```
+
+Phir **alag-alag** (ek command, Enter, agla command):
+
+```bash
 cd MasterBot
+```
+```bash
 git checkout claude/hosting-bot-ui-perf-20cygb
+```
+```bash
 chmod +x deploy/*.sh
+```
+```bash
 ./deploy/setup_vps.sh
 ```
 
@@ -115,16 +134,15 @@ Ye khud karega:
 ## STEP 7 — Bot ko permanent chalu karo
 
 ```bash
-sudo cp deploy/masterbot.service /etc/systemd/system/
-sudo sed -i "s/__USER__/$USER/g" /etc/systemd/system/masterbot.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now masterbot
+./deploy/install_service.sh
 ```
 
-Check karo:
+Ye khud sahi user aur folder detect karega (root ke liye bhi — root ka home
+`/root` hota hai, `/home/root` nahi), aur fail hone pe error dikha dega.
+
+Live logs:
 ```bash
-systemctl status masterbot
-journalctl -u masterbot -f     # live logs — Ctrl+C se bahar
+journalctl -u masterbot -f     # Ctrl+C se bahar
 ```
 
 ---
