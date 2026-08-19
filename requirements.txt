@@ -19,4 +19,4 @@ anyio==4.3.0
 # Speed: faster (libuv-based) event loop. Linux/macOS only — code falls
 # back to default asyncio automatically if this fails to install (e.g. on
 # Windows or Render's older build images), so it's safe to leave pinned.
-uvloop==0.19.0; sys_platform != "win32"
+uvloop>=0.19; sys_platform != "win32"

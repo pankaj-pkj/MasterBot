@@ -18,7 +18,22 @@ cd "$(dirname "$0")/.."   # repo root
 
 echo "── System packages ──"
 sudo apt update -y
-sudo apt install -y python3.11 python3.11-venv python3-pip git
+sudo apt install -y python3 python3-venv python3-pip git curl
+
+# The code needs Python 3.10+ (uses `X | None` type syntax). Ubuntu 22.04
+# ships 3.10 and 24.04 ships 3.12 — both fine. Only fall back to installing
+# a specific version if the system python is genuinely too old.
+PY=python3
+PYV=$($PY -c 'import sys;print("%d%d"%sys.version_info[:2])' 2>/dev/null || echo 0)
+if [ "$PYV" -lt 310 ]; then
+    echo "   System python is too old ($PYV) — installing python3.11…"
+    sudo apt install -y software-properties-common
+    sudo add-apt-repository -y ppa:deadsnakes/ppa
+    sudo apt update -y
+    sudo apt install -y python3.11 python3.11-venv
+    PY=python3.11
+fi
+echo "   Using: $($PY --version)"
 
 echo "── 2GB swap (safety net — 4GB RAM alone can still OOM under a burst) ──"
 if [ ! -f /swapfile ]; then
@@ -35,7 +50,7 @@ else
 fi
 
 echo "── Python venv + dependencies (incl. uvloop speed boost) ──"
-python3.11 -m venv venv
+$PY -m venv venv
 ./venv/bin/pip install --upgrade pip -q
 ./venv/bin/pip install -r requirements.txt -q
 
