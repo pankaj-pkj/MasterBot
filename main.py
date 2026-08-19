@@ -77,16 +77,29 @@ if not BOT_TOKEN:
 # ══════════════════════════════════════════════════════════════════════
 ADMIN_IDS: set[int] = {6960252072}
 
-FREE_SLOTS        = 3
+FREE_SLOTS        = 2      # free tier: max 2 bot UPLOADS
+FREE_RAM_MB       = 200    # free tier: 200MB RAM budget (all bots combined)
 MAX_FAST_CRASHES  = 3
 FAST_CRASH_SEC    = 30
 MAX_HEAL_TRIES    = 2
 STARTUP_DELAY_SEC = 5    # staggered startup: wait N seconds between each bot
 
+# ── RAM quota enforcement ─────────────────────────────────────────────
+# A bot-count limit alone is NOT enforceable: a user can upload one
+# "hosting bot" that itself spawns 20 child processes and it still counts
+# as 1 bot. So the REAL limit is RAM, measured over each bot's entire
+# PROCESS TREE (children, grandchildren…). That closes the loophole.
+RAM_CHECK_SEC     = 15     # how often to sample per-bot memory
+RAM_GRACE_SEC     = 45     # allow a bot to exceed briefly (startup spikes)
+RAM_KILL_MARGIN   = 1.15   # only kill once >115% of quota (avoid flapping)
+
 PLANS = {
-    "starter": {"stars": 15,  "slots": 3,  "label": "Starter ⭐",  "desc": "+3 slots"},
-    "pro":     {"stars": 50,  "slots": 10, "label": "Pro 💎",      "desc": "+10 slots"},
-    "elite":   {"stars": 100, "slots": 25, "label": "Elite 👑",    "desc": "+25 slots"},
+    "starter": {"stars": 15,  "slots": 3,  "ram": 512,  "label": "Starter ⭐",
+                "desc": "+3 bots · +512MB"},
+    "pro":     {"stars": 50,  "slots": 10, "ram": 1024, "label": "Pro 💎",
+                "desc": "+10 bots · +1GB"},
+    "elite":   {"stars": 100, "slots": 25, "ram": 2048, "label": "Elite 👑",
+                "desc": "+25 bots · +2GB"},
 }
 
 STDLIB: set[str] = {
@@ -506,21 +519,34 @@ def load_usernames():
 def save_username(uid: int, name: str):
     if name: USER_NAMES[str(uid)] = name; _jsave(DATA_DIR/"usernames.json", USER_NAMES)
 
+def _default_user() -> dict:
+    return {"slots": FREE_SLOTS, "ram_mb": FREE_RAM_MB,
+            "stars_spent": 0, "banned": False}
+
 def get_user(uid: int) -> dict:
     data = load_users(); k = str(uid)
     if k not in data:
-        data[k] = {"slots": FREE_SLOTS, "stars_spent": 0, "banned": False}
+        data[k] = _default_user()
+        save_users(data)
+    # Back-fill ram_mb for users created before RAM quotas existed
+    if "ram_mb" not in data[k]:
+        data[k]["ram_mb"] = FREE_RAM_MB
         save_users(data)
     return data[k]
 
 def _upd_user(uid, patch):
     data = load_users(); k = str(uid)
-    if k not in data: data[k] = {"slots": FREE_SLOTS, "stars_spent": 0, "banned": False}
+    if k not in data: data[k] = _default_user()
     data[k].update(patch); save_users(data)
 
 def set_user_slots(uid, s):   _upd_user(uid, {"slots": s})
 def add_user_slots(uid, n):
     u = get_user(uid); new = u["slots"]+n; set_user_slots(uid, new); return new
+def get_user_ram_quota(uid: int) -> int:
+    return int(get_user(uid).get("ram_mb", FREE_RAM_MB))
+def set_user_ram(uid, mb):    _upd_user(uid, {"ram_mb": int(mb)})
+def add_user_ram(uid, mb):
+    new = get_user_ram_quota(uid) + int(mb); set_user_ram(uid, new); return new
 def add_user_stars(uid, s):
     u = get_user(uid); _upd_user(uid, {"stars_spent": u.get("stars_spent",0)+s})
 def is_banned(uid): return bool(get_user(uid).get("banned", False))
@@ -781,6 +807,68 @@ MEM_EASE_PCT  = 72.0    # stop offloading once back under this %
 MEM_MAX_MOVE  = 3       # max bots moved per cycle (let RAM settle)
 
 
+def _pid_rss_kb(pid: int) -> int:
+    """RSS of a single pid in KB (0 if the process is gone)."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+
+def _child_pids(pid: int) -> list[int]:
+    """Direct children of a pid, via /proc/<pid>/task/*/children."""
+    kids: list[int] = []
+    try:
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            try:
+                raw = (task / "children").read_text().split()
+                kids.extend(int(x) for x in raw)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return kids
+
+
+def proc_tree_rss_mb(pid: int, _depth: int = 0) -> float:
+    """
+    Total RSS (MB) of a process AND every descendant.
+
+    This is the key to a fair quota: a user's "hosting bot" that spawns 20
+    sub-bots shows up as ONE registered bot, but its process TREE reveals
+    the real memory it is consuming. Counting bots is gameable; counting
+    the tree is not.
+    """
+    if _depth > 12 or pid <= 0:      # cycle/runaway guard
+        return 0.0
+    total_kb = _pid_rss_kb(pid)
+    for kid in _child_pids(pid):
+        total_kb += proc_tree_rss_mb(kid, _depth + 1) * 1024
+    return total_kb / 1024.0
+
+
+def bot_rss_mb(bot_key: str) -> float:
+    """Current process-tree memory of one running bot, in MB."""
+    e = RUNNING_BOTS.get(bot_key) or {}
+    p = e.get("process")
+    if not p or p.poll() is not None:
+        return 0.0
+    return proc_tree_rss_mb(p.pid)
+
+
+def get_user_ram_used(uid: int) -> float:
+    """Sum of process-tree memory across all of this user's local bots."""
+    total = 0.0
+    for bot_key, e in RUNNING_BOTS.items():
+        if str(e.get("owner_id", "")) != str(uid):
+            continue
+        total += e.get("rss_mb") or 0.0
+    return total
+
+
 def _read_int(path: str):
     try: return int(Path(path).read_text().strip())
     except Exception: return None
@@ -852,6 +940,66 @@ async def offload_bots_for_memory(pct: float) -> int:
     return moved
 
 
+async def ram_quota_loop():
+    """
+    Sample every local bot's process-tree RAM, cache it on the bot entry,
+    and enforce each user's quota.
+
+    Enforcement is deliberately forgiving: a bot must stay over quota for
+    RAM_GRACE_SEC (and exceed it by RAM_KILL_MARGIN) before anything is
+    stopped, so normal startup spikes never kill a healthy bot.
+    """
+    await asyncio.sleep(30)
+    over_since: dict[int, float] = {}
+    while True:
+        try:
+            # 1. Refresh per-bot memory (cheap /proc reads, off the loop)
+            keys = list(RUNNING_BOTS.keys())
+            for bot_key in keys:
+                e = RUNNING_BOTS.get(bot_key)
+                if not e or not e.get("active"):
+                    if e: e["rss_mb"] = 0.0
+                    continue
+                e["rss_mb"] = await asyncio.to_thread(bot_rss_mb, bot_key)
+
+            # 2. Per-user quota check
+            owners = {e.get("owner_id") for e in RUNNING_BOTS.values()
+                      if e.get("active") and e.get("owner_id")}
+            now = time.time()
+            for uid in owners:
+                if not uid or is_admin(uid):
+                    continue
+                quota = get_user_ram_quota(uid)
+                used  = get_user_ram_used(uid)
+                if used <= quota * RAM_KILL_MARGIN:
+                    over_since.pop(uid, None)
+                    continue
+                first = over_since.setdefault(uid, now)
+                if now - first < RAM_GRACE_SEC:
+                    continue          # still in grace period
+                over_since.pop(uid, None)
+
+                # Stop the single biggest offender, not everything.
+                mine = [(k, e) for k, e in RUNNING_BOTS.items()
+                        if str(e.get("owner_id","")) == str(uid) and e.get("active")]
+                if not mine:
+                    continue
+                worst_key, worst = max(mine, key=lambda kv: kv[1].get("rss_mb") or 0)
+                worst_mb = worst.get("rss_mb") or 0
+                log.warning("RAM QUOTA: uid=%s used=%.0fMB quota=%dMB — stopping %s (%.0fMB)",
+                            uid, used, quota, worst_key, worst_mb)
+                _do_stop(worst_key)
+                await _notify(uid,
+                    f"🛑 *RAM limit reached*\n\n"
+                    f"*{display_name(worst_key)}* was stopped — it used "
+                    f"`{worst_mb:.0f}MB`.\n\n"
+                    f"📊 Your usage: `{used:.0f}MB / {quota}MB`\n\n"
+                    f"💡 Free up memory, or get more RAM with ⭐ Stars: /buyram")
+        except Exception as e:
+            log.warning("RAM quota loop error: %s", e)
+        await asyncio.sleep(RAM_CHECK_SEC)
+
+
 async def memory_guard_loop():
     """Background: sample memory; offload to nodes before OOM kills us."""
     await asyncio.sleep(45)
@@ -877,6 +1025,58 @@ async def memory_guard_loop():
         except Exception as e:
             log.warning("Memory guard error: %s", e)
         await asyncio.sleep(MEM_CHECK_SEC)
+
+
+async def cmd_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Any user: /usage — show my RAM usage per bot vs my quota."""
+    uid = update.effective_user.id
+    if is_banned(uid): return
+    quota = get_user_ram_quota(uid)
+    mine  = [(k, e) for k, e in RUNNING_BOTS.items()
+             if str(e.get("owner_id","")) == str(uid)]
+    used  = get_user_ram_used(uid)
+    pct   = (used / quota * 100) if quota else 0
+    n     = min(int(pct / 10), 10)
+    bar   = "█" * n + "░" * (10 - n)
+    lines = [f"🧠 *Your RAM Usage*\n",
+             f"`{bar}` *{pct:.0f}%*",
+             f"`{used:.0f}MB` / `{quota}MB`\n"]
+    running = [(k, e) for k, e in mine if e.get("active")]
+    if running:
+        lines.append("*Per bot:*")
+        for k, e in sorted(running, key=lambda kv: -(kv[1].get("rss_mb") or 0)):
+            lines.append(f"  🔹 {display_name(k)} — `{(e.get('rss_mb') or 0):.0f}MB`")
+    else:
+        lines.append("_No bots running right now._")
+    used_slots = get_used_slots(uid)
+    lines.append(f"\n📦 Bots: `{used_slots}/{get_user(uid)['slots']}`")
+    lines.append("\n💡 Need more? /buyram")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_buyram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Any user: /buyram — show the RAM/slot plans."""
+    uid = update.effective_user.id
+    if is_banned(uid): return
+    await update.message.reply_text(
+        "💰 *Upgrade with ⭐ Stars*\n\n"
+        f"Free tier: `{FREE_RAM_MB}MB` RAM · `{FREE_SLOTS}` bots\n\n"
+        "_Limits are based on real memory used — including any\n"
+        "sub-processes your bot starts._",
+        parse_mode="Markdown", reply_markup=kb_plans())
+
+
+async def cmd_setram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /setram <user_id> <mb>"""
+    uid = update.effective_user.id
+    if not is_admin(uid): return
+    try: target = int(ctx.args[0]); mb = int(ctx.args[1])
+    except Exception:
+        await update.message.reply_text("Usage: `/setram <id> <mb>`",
+                                        parse_mode="Markdown"); return
+    set_user_ram(target, mb); push_to_github(f"RAM: {target}→{mb}MB")
+    await update.message.reply_text(f"✅ `{target}` → *{mb}MB* RAM.",
+                                    parse_mode="Markdown")
 
 
 async def cmd_ram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1264,11 +1464,13 @@ def home_text(uid):
     plan="Admin 👑" if is_admin(uid) else "Free ✨"
     nodes=load_nodes()
     node_info=f"\n🌐 Nodes: `{len(nodes)}` worker(s) connected" if nodes and is_admin(uid) else ""
+    ram_used=get_user_ram_used(uid); ram_q=get_user_ram_quota(uid)
     return (f"🤖 *Master Hosting Bot v4.1*\n\n"
             f"👤 Plan  : {plan}\n"
-            f"📦 Slots : `{used}/{u['slots']}` used{node_info}\n\n"
+            f"📦 Bots  : `{used}/{u['slots']}`\n"
+            f"🧠 RAM   : `{ram_used:.0f}/{ram_q}MB`{node_info}\n\n"
             f"Send `.zip`, `.py` or paste Python code!\n"
-            f"💎 Web IDE: /ide\n\n_Codian Studio 💎_")
+            f"💎 Web IDE: /ide  ·  📊 /usage\n\n_Codian Studio 💎_")
 
 def mybots_card(uid):
     bots=get_user_bots(uid)
@@ -1839,15 +2041,21 @@ async def handle_callback(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     elif d=="my_stats":
         u=get_user(uid); used=get_used_slots(uid); bots=get_user_bots(uid)
         run=sum(1 for b in bots if RUNNING_BOTS.get(b,{}).get("status")=="Running 🟢")
-        await q.edit_message_text(f"📊 *Stats*\n\n🆔`{uid}`\n📦`{used}/{u['slots']}`\n🤖`{len(bots)}` 🟢`{run}`\n⭐`{u.get('stars_spent',0)}`",
-                                   parse_mode="Markdown",reply_markup=kb_back())
+        ram_used=get_user_ram_used(uid); ram_q=get_user_ram_quota(uid)
+        await q.edit_message_text(
+            f"📊 *Stats*\n\n🆔`{uid}`\n📦`{used}/{u['slots']}` bots\n"
+            f"🧠`{ram_used:.0f}/{ram_q}MB` RAM\n🤖`{len(bots)}` 🟢`{run}`\n"
+            f"⭐`{u.get('stars_spent',0)}`",
+            parse_mode="Markdown",reply_markup=kb_back())
     elif d=="buy_plan":
-        await q.edit_message_text("💰 *Buy Slots*\n\nPay with ⭐ Stars:",parse_mode="Markdown",reply_markup=kb_plans())
+        await q.edit_message_text(
+            f"💰 *Upgrade*\n\nFree: `{FREE_RAM_MB}MB` · `{FREE_SLOTS}` bots\n\n"
+            f"Pay with ⭐ Stars:",parse_mode="Markdown",reply_markup=kb_plans())
     elif d.startswith("buy_"):
         plan_key=d[4:]; plan=PLANS.get(plan_key)
         if not plan: await q.answer("Unknown.",show_alert=True); return
         await ctx.bot.send_invoice(chat_id=uid,title=plan["label"],
-            description=f"{plan['slots']} extra slots — {plan['desc']}",
+            description=f"{plan['desc']}",
             payload=f"{plan_key}|{uid}",provider_token="",currency="XTR",
             prices=[LabeledPrice(plan["label"],plan["stars"])])
     elif d=="admin_panel":
@@ -1872,9 +2080,12 @@ async def payment_success(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     try: plan_key,uid_str=payment.invoice_payload.split("|"); uid=int(uid_str); plan=PLANS[plan_key]
     except: await update.message.reply_text("⚠️ Payment ok — contact admin."); return
     new_slots=add_user_slots(uid,plan["slots"]); add_user_stars(uid,plan["stars"])
+    new_ram=add_user_ram(uid,plan.get("ram",0))
     push_to_github(f"Stars: {plan_key} uid={uid}")
     await update.message.reply_text(
-        f"🎉 *Payment OK!*\n\n📦 *{plan['label']}*\n➕ +{plan['slots']} slots\n📊 Total: *{new_slots}*\n\n_Codian Studio 💎_",
+        f"🎉 *Payment OK!*\n\n📦 *{plan['label']}*\n"
+        f"➕ +{plan['slots']} bots · +{plan.get('ram',0)}MB RAM\n\n"
+        f"📊 Now: *{new_slots}* bots · *{new_ram}MB* RAM\n\n_Codian Studio 💎_",
         parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Deploy",callback_data="how_host")]]))
 
 
@@ -2078,6 +2289,9 @@ async def main():
         CommandHandler("delete",      cmd_delete),
         CommandHandler("getlog",      cmd_getlog),
         CommandHandler("info",        cmd_info),
+        CommandHandler("usage",       cmd_usage),
+        CommandHandler("buyram",      cmd_buyram),
+        CommandHandler("setram",      cmd_setram),
         CommandHandler("pr",          cmd_pr),
         CommandHandler("ban",         cmd_ban),
         CommandHandler("unban",       cmd_unban),
@@ -2102,6 +2316,7 @@ async def main():
     asyncio.create_task(keep_alive_loop())
     asyncio.create_task(node_health_monitor())   # auto-failover
     asyncio.create_task(memory_guard_loop())     # RAM-based auto-offload
+    asyncio.create_task(ram_quota_loop())        # per-user RAM quota enforcement
     if AUTOSTART:
         await autostart()   # staggered (opt-in via AUTOSTART=true)
     else:
@@ -2125,6 +2340,8 @@ async def main():
             BotCommand("ide",         "💎 Web IDE"),
             BotCommand("mybots",      "🤖 My bots"),
             BotCommand("info",        "📊 My info"),
+            BotCommand("usage",       "🧠 My RAM usage"),
+            BotCommand("buyram",      "⭐ Get more RAM"),
             BotCommand("stop",        "🛑 Stop bot"),
             BotCommand("restart",     "🔄 Restart bot"),
             BotCommand("delete",      "🗑 Delete bot"),
