@@ -14,8 +14,7 @@
 ║  Mobile zoom: 3-method fix (gesture + doubletap + ctrlwheel)       ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
-import os, json, time, uuid, shutil, asyncio, logging, mimetypes, hmac, hashlib
-from urllib.parse import parse_qsl
+import os, json, time, uuid, shutil, asyncio, logging, mimetypes
 from pathlib import Path
 from typing  import Optional
 from aiohttp import web
@@ -36,17 +35,14 @@ _BLOCKED_IPS_FILE = DATA_DIR / "ide_blocked_ips.json"
 
 
 _RUN_BOT_FN = None   # set by main.py so IDE can start stopped bots
-_BOT_TOKEN  = ""     # set by main.py — used to verify Telegram Mini-App logins
 
 
-def init_editor(running_bots, app_ref=None, admin_ids=None, run_bot_fn=None,
-                bot_token=""):
-    global _RUNNING_BOTS, _APP_REF, _ADMIN_IDS, _RUN_BOT_FN, _BOT_TOKEN
+def init_editor(running_bots, app_ref=None, admin_ids=None, run_bot_fn=None):
+    global _RUNNING_BOTS, _APP_REF, _ADMIN_IDS, _RUN_BOT_FN
     _RUNNING_BOTS = running_bots
     _APP_REF      = app_ref
     _ADMIN_IDS    = admin_ids or set()
     _RUN_BOT_FN   = run_bot_fn
-    _BOT_TOKEN    = bot_token or ""
 
 
 # ── Token / Auth ──────────────────────────────────────────────────────
@@ -79,39 +75,6 @@ def _auth(req: web.Request) -> tuple[int, bool]:
     if not tok: return 0, False
     uid = _lj(_TOKENS_FILE, {}).get(tok, 0)
     return uid, uid in _ADMIN_IDS
-
-
-def verify_tg_initdata(init_data: str) -> int:
-    """
-    Validate Telegram Mini-App initData and return the user id (0 if invalid).
-
-    Algorithm (Telegram spec):
-      secret = HMAC_SHA256(key="WebAppData", msg=bot_token)
-      check  = HMAC_SHA256(key=secret, msg=data_check_string) == hash
-    where data_check_string is every field except `hash`, sorted, joined by \n.
-    """
-    if not init_data or not _BOT_TOKEN:
-        return 0
-    try:
-        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
-        got_hash = pairs.pop("hash", "")
-        if not got_hash:
-            return 0
-        dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
-        secret = hmac.new(b"WebAppData", _BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, got_hash):
-            return 0
-        # Reject stale logins (> 24h) to limit replay
-        try:
-            if time.time() - int(pairs.get("auth_date", "0")) > 86400:
-                return 0
-        except ValueError:
-            pass
-        user = json.loads(pairs.get("user", "{}"))
-        return int(user.get("id", 0))
-    except Exception:
-        return 0
 
 def _ip(req): return req.headers.get("X-Forwarded-For", req.remote or "?").split(",")[0].strip()
 def _blocked(ip): return ip in _lj(_BLOCKED_IPS_FILE, [])
@@ -447,24 +410,8 @@ async def editor_page(req):
     if not uid2: return web.Response(text=_LOGIN,content_type="text/html",status=401)
     return web.Response(text=_IDE,content_type="text/html")
 
-async def tg_login(req):
-    """Telegram Mini-App login: validate initData, hand back a session cookie."""
-    if _blocked(_ip(req)): return web.json_response({"error":"blocked"},status=403)
-    try:
-        body = await req.json()
-    except Exception:
-        return web.json_response({"error":"bad request"},status=400)
-    uid = verify_tg_initdata(body.get("initData",""))
-    if not uid:
-        return web.json_response({"error":"invalid"},status=401)
-    tok = get_user_token(uid)
-    resp = web.json_response({"ok":True})
-    resp.set_cookie("ide_token",tok,max_age=86400*30,httponly=True,samesite="Strict")
-    return resp
-
 def register_routes(app):
     app.router.add_get("/editor",             editor_page)
-    app.router.add_post("/editor/tglogin",    tg_login)
     app.router.add_get("/editor/api/tree",    api_tree)
     app.router.add_get("/editor/api/file",    api_read)
     app.router.add_post("/editor/api/file",   api_write)
@@ -505,35 +452,16 @@ button{width:100%;background:#238636;border:none;border-radius:6px;padding:12px;
 button:hover{background:#2ea043}
 .hint{color:#8b949e;font-size:.75rem;margin-top:14px;line-height:1.6}
 code{background:#30363d;padding:2px 6px;border-radius:4px;color:#79c0ff}
-</style>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-</head><body>
+</style></head><body>
 <div class="c"><div class="logo">💎</div><h1>Codian Studio IDE</h1>
-<p id="sub">Master Hosting Bot</p>
+<p>Master Hosting Bot</p>
 <input type="password" id="t" placeholder="Paste your access token"
        autocomplete="off" autocorrect="off" autocapitalize="off"
        onkeydown="if(event.key==='Enter')go()">
 <button onclick="go()">Sign In →</button>
 <p class="hint">Get token from bot: <code>/ide</code></p></div>
-<script>
-function go(){var t=document.getElementById('t').value.trim();
+<script>function go(){var t=document.getElementById('t').value.trim();
 if(!t)return;window.location.href='/editor?token='+encodeURIComponent(t);}
-// Telegram Mini-App: if opened via the bot's menu button, log in silently.
-(function(){
-  try{
-    var wa=window.Telegram&&window.Telegram.WebApp;
-    if(wa&&wa.initData){
-      wa.expand&&wa.expand();
-      document.getElementById('sub').textContent='Signing you in…';
-      fetch('/editor/tglogin',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({initData:wa.initData})})
-        .then(r=>r.json()).then(d=>{
-          if(d&&d.ok){window.location.href='/editor';}
-          else{document.getElementById('sub').textContent='Master Hosting Bot';}
-        }).catch(function(){});
-    }
-  }catch(e){}
-})();
 </script></body></html>"""
 
 

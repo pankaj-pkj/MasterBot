@@ -35,7 +35,7 @@ from aiohttp import web
 from telegram import (
     Update, BotCommand, LabeledPrice,
     KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, MenuButtonWebApp, MenuButtonCommands, WebAppInfo,
+    ReplyKeyboardMarkup, MenuButtonCommands,
 )
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
@@ -1522,42 +1522,58 @@ async def _notify(owner_id,text):
 #  KEYBOARDS
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Coloured buttons (Bot API 9.4) ────────────────────────────────────
+# style: "primary" (blue) · "success" (green) · "danger" (red).
+# Sent via api_kwargs so it works on python-telegram-bot 20.8 without a
+# risky major upgrade. Telegram clients older than Feb 2026 (or a server
+# without the field) simply render a normal button — never a breakage.
+def ib(text, style=None, icon=None, **kw):
+    ak = {}
+    if style: ak["style"] = style
+    if icon:  ak["icon_custom_emoji_id"] = icon
+    return InlineKeyboardButton(text, api_kwargs=(ak or None), **kw)
+
+def rb(text, style=None, **kw):
+    ak = {"style": style} if style else None
+    return KeyboardButton(text, api_kwargs=ak, **kw)
+
+
 def reply_kb(admin=False):
-    rows=[[KeyboardButton(_RKB["bots"]),KeyboardButton(_RKB["dep"])],
-          [KeyboardButton(_RKB["slots"]),KeyboardButton(_RKB["stats"])],
-          [KeyboardButton(_RKB["help"])]]
-    if admin: rows.append([KeyboardButton(_RKB["admin"])])
+    rows=[[rb(_RKB["bots"],"primary"), rb(_RKB["dep"],"success")],
+          [rb(_RKB["slots"],"success"), rb(_RKB["stats"],"primary")],
+          [rb(_RKB["help"])]]
+    if admin: rows.append([rb(_RKB["admin"],"danger")])
     return ReplyKeyboardMarkup(rows,resize_keyboard=True,one_time_keyboard=False)
 
 def kb_home(admin=False):
-    rows=[[InlineKeyboardButton("🤖 My Bots",callback_data="my_bots"),
-           InlineKeyboardButton("📦 Deploy", callback_data="how_host")],
-          [InlineKeyboardButton("💰 Buy Slots",callback_data="buy_plan"),
-           InlineKeyboardButton("📊 Stats",   callback_data="my_stats")]]
-    if admin: rows.append([InlineKeyboardButton("👑 Admin",callback_data="admin_panel")])
+    rows=[[ib("🤖 My Bots","primary",callback_data="my_bots"),
+           ib("📦 Deploy","success",callback_data="how_host")],
+          [ib("💰 Buy Slots","success",callback_data="buy_plan"),
+           ib("📊 Stats","primary",callback_data="my_stats")]]
+    if admin: rows.append([ib("👑 Admin","danger",callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 def kb_plans():
-    rows=[[InlineKeyboardButton(f"{p['label']} — {p['stars']} ⭐ ({p['desc']})",
-                                callback_data=f"buy_{k}")] for k,p in PLANS.items()]
-    rows.append([InlineKeyboardButton("🔙 Back",callback_data="main_menu")])
+    rows=[[ib(f"{p['label']} — {p['stars']} ⭐ ({p['desc']})","success",
+              callback_data=f"buy_{k}")] for k,p in PLANS.items()]
+    rows.append([ib("🔙 Back",callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
 def kb_bot_card(bot_key,can):
     rows=[]
     if can:
-        rows.append([InlineKeyboardButton("🛑 Stop",   callback_data=f"stop|{bot_key}"),
-                     InlineKeyboardButton("🔄 Restart",callback_data=f"restart|{bot_key}"),
-                     InlineKeyboardButton("🗑 Delete", callback_data=f"delete|{bot_key}")])
-        rows.append([InlineKeyboardButton("📋 Logs",   callback_data=f"logs|{bot_key}"),
-                     InlineKeyboardButton("🔍 Error",  callback_data=f"errinfo|{bot_key}"),
-                     InlineKeyboardButton("⬇ Log",    callback_data=f"getlog|{bot_key}")])
-    rows.append([InlineKeyboardButton("🔙 Back",callback_data="my_bots")])
+        rows.append([ib("🛑 Stop","danger",   callback_data=f"stop|{bot_key}"),
+                     ib("🔄 Restart","primary",callback_data=f"restart|{bot_key}"),
+                     ib("🗑 Delete","danger",  callback_data=f"delete|{bot_key}")])
+        rows.append([ib("📋 Logs",   callback_data=f"logs|{bot_key}"),
+                     ib("🔍 Error",  callback_data=f"errinfo|{bot_key}"),
+                     ib("⬇ Log",    callback_data=f"getlog|{bot_key}")])
+    rows.append([ib("🔙 Back",callback_data="my_bots")])
     return InlineKeyboardMarkup(rows)
 
 def kb_back(to="main_menu"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(
-        "🏠 Home" if to=="main_menu" else "🔙 Back",callback_data=to)]])
+    return InlineKeyboardMarkup([[ib(
+        "🏠 Home" if to=="main_menu" else "🔙 Back","primary",callback_data=to)]])
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2363,7 +2379,7 @@ async def main():
 
     # Pass run_bot so the Web IDE's ▶ Run can actually START a stopped /
     # newly-created bot (not just flag a restart on an already-looping one).
-    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot, bot_token=BOT_TOKEN)
+    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot)
 
     _APP = (
         ApplicationBuilder()
@@ -2471,21 +2487,9 @@ async def main():
         ])
     except Exception: pass
 
-    # ── Blue "Menu" button next to the message box ────────────────────
-    # If we have an HTTPS domain, make it a colourful Web-App button that
-    # opens the IDE right inside Telegram; otherwise fall back to the
-    # commands menu. WebApp buttons REQUIRE https, so guard on RENDER_URL.
+    # Blue "Menu" button next to the message box → command list.
     try:
-        if RENDER_URL.startswith("https://"):
-            await _APP.bot.set_chat_menu_button(
-                menu_button=MenuButtonWebApp(
-                    text="💎 Studio",
-                    web_app=WebAppInfo(url=f"{RENDER_URL}/editor"),
-                ))
-            log.info("Menu button → WebApp (%s/editor)", RENDER_URL)
-        else:
-            await _APP.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-            log.info("Menu button → Commands (no https domain set)")
+        await _APP.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     except Exception as e:
         log.warning("Menu button setup failed: %s", e)
 
