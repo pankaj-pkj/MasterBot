@@ -1184,6 +1184,83 @@ async def cmd_disk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await sm.edit_text("\n".join(lines), parse_mode="Markdown")
 
 
+def _meminfo():
+    """Return (total_mb, used_mb, swap_used_mb, swap_total_mb) from /proc."""
+    info = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            info[k.strip()] = int(v.split()[0])  # kB
+    except Exception:
+        return (0, 0, 0, 0)
+    total = info.get("MemTotal", 0) / 1024
+    avail = info.get("MemAvailable", 0) / 1024
+    used  = total - avail
+    sw_t  = info.get("SwapTotal", 0) / 1024
+    sw_f  = info.get("SwapFree", 0) / 1024
+    return (total, used, sw_t - sw_f, sw_t)
+
+
+async def _cpu_percent(sample=0.5):
+    """Whole-system CPU busy % over a short sampling window."""
+    def read():
+        try:
+            parts = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+            nums = [int(x) for x in parts]
+            idle = nums[3] + (nums[4] if len(nums) > 4 else 0)   # idle+iowait
+            return sum(nums), idle
+        except Exception:
+            return (0, 0)
+    t1, i1 = read()
+    await asyncio.sleep(sample)
+    t2, i2 = read()
+    dt, di = t2 - t1, i2 - i1
+    if dt <= 0:
+        return 0.0
+    return max(0.0, min(100.0, (1 - di / dt) * 100))
+
+
+def _bar(pct, n=10):
+    f = min(int(pct / (100 / n)), n)
+    return "█" * f + "░" * (n - f)
+
+
+async def cmd_server(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin: /server — full CPU + RAM + disk + uptime snapshot."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    sm = await update.message.reply_text("🖥 Reading server stats…")
+
+    cores    = os.cpu_count() or 1
+    cpu_pct  = await _cpu_percent()
+    try:    load1, load5, load15 = os.getloadavg()
+    except Exception: load1 = load5 = load15 = 0.0
+    mem_t, mem_u, sw_u, sw_t = _meminfo()
+    st = await asyncio.to_thread(shutil.disk_usage, "/")
+    disk_t = st.total / (1024**3); disk_u = st.used / (1024**3); disk_f = st.free / (1024**3)
+    try:    up = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception: up = 0.0
+
+    mem_pct  = (mem_u / mem_t * 100) if mem_t else 0
+    disk_pct = (st.used / st.total * 100) if st.total else 0
+    running  = sum(1 for e in RUNNING_BOTS.values() if e.get("status") == "Running 🟢")
+
+    await sm.edit_text(
+        "🖥 *Server Status*\n\n"
+        f"⚙️ *CPU* ({cores} cores)\n`{_bar(cpu_pct)}` {cpu_pct:.0f}%\n"
+        f"📈 Load: `{load1:.2f}` `{load5:.2f}` `{load15:.2f}`\n\n"
+        f"🧠 *RAM*\n`{_bar(mem_pct)}` {mem_pct:.0f}%\n"
+        f"`{mem_u:.0f}` / `{mem_t:.0f}` MB used\n"
+        + (f"💤 Swap: `{sw_u:.0f}` / `{sw_t:.0f}` MB\n" if sw_t else "")
+        + f"\n💾 *Disk*\n`{_bar(disk_pct)}` {disk_pct:.0f}%\n"
+        f"`{disk_u:.1f}` / `{disk_t:.1f}` GB used  ·  free `{disk_f:.1f}` GB\n\n"
+        f"🤖 Bots: `{running}` running / `{len(RUNNING_BOTS)}` total\n"
+        f"🌐 Nodes: `{len(load_nodes())}`\n"
+        f"⏱ Uptime: `{fmt_up(up)}`",
+        parse_mode="Markdown")
+
+
 async def cmd_ram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin: /ram — show current memory usage + offload thresholds."""
     uid = update.effective_user.id
@@ -2425,6 +2502,7 @@ async def main():
         CommandHandler("nodes",       cmd_nodes),
         CommandHandler("ram",         cmd_ram),
         CommandHandler("disk",        cmd_disk),
+        CommandHandler("server",      cmd_server),
         CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
@@ -2480,6 +2558,7 @@ async def main():
             BotCommand("nodes",       "👑 Worker nodes"),
             BotCommand("ram",         "👑 Memory usage"),
             BotCommand("disk",        "👑 Disk usage"),
+            BotCommand("server",      "👑 Full server status"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
             BotCommand("msg",         "👑 Broadcast"),
