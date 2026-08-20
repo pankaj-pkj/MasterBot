@@ -35,7 +35,7 @@ from aiohttp import web
 from telegram import (
     Update, BotCommand, LabeledPrice,
     KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardMarkup, MenuButtonWebApp, MenuButtonCommands, WebAppInfo,
 )
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
@@ -126,7 +126,7 @@ if not BOT_TOKEN:
 # ══════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
-ADMIN_IDS: set[int] = {6960252072}
+ADMIN_IDS: set[int] = {6960252072, 8721161061}
 
 FREE_SLOTS        = 2      # free tier: max 2 bot UPLOADS
 FREE_RAM_MB       = 200    # free tier: 200MB RAM budget (all bots combined)
@@ -145,11 +145,11 @@ RAM_GRACE_SEC     = 45     # allow a bot to exceed briefly (startup spikes)
 RAM_KILL_MARGIN   = 1.15   # only kill once >115% of quota (avoid flapping)
 
 PLANS = {
-    "starter": {"stars": 15,  "slots": 3,  "ram": 512,  "label": "Starter ⭐",
+    "starter": {"stars": 50,  "slots": 3,  "ram": 512,  "label": "Starter ⭐",
                 "desc": "+3 bots · +512MB"},
-    "pro":     {"stars": 50,  "slots": 10, "ram": 1024, "label": "Pro 💎",
+    "pro":     {"stars": 99,  "slots": 10, "ram": 1024, "label": "Pro 💎",
                 "desc": "+10 bots · +1GB"},
-    "elite":   {"stars": 100, "slots": 25, "ram": 2048, "label": "Elite 👑",
+    "elite":   {"stars": 189, "slots": 25, "ram": 2048, "label": "Elite 👑",
                 "desc": "+25 bots · +2GB"},
 }
 
@@ -2357,7 +2357,7 @@ async def main():
 
     # Pass run_bot so the Web IDE's ▶ Run can actually START a stopped /
     # newly-created bot (not just flag a restart on an already-looping one).
-    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot)
+    web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot, bot_token=BOT_TOKEN)
 
     _APP = (
         ApplicationBuilder()
@@ -2464,6 +2464,24 @@ async def main():
             BotCommand("pr",          "👑 Set slots"),
         ])
     except Exception: pass
+
+    # ── Blue "Menu" button next to the message box ────────────────────
+    # If we have an HTTPS domain, make it a colourful Web-App button that
+    # opens the IDE right inside Telegram; otherwise fall back to the
+    # commands menu. WebApp buttons REQUIRE https, so guard on RENDER_URL.
+    try:
+        if RENDER_URL.startswith("https://"):
+            await _APP.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="💎 Studio",
+                    web_app=WebAppInfo(url=f"{RENDER_URL}/editor"),
+                ))
+            log.info("Menu button → WebApp (%s/editor)", RENDER_URL)
+        else:
+            await _APP.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            log.info("Menu button → Commands (no https domain set)")
+    except Exception as e:
+        log.warning("Menu button setup failed: %s", e)
 
     log.info("✅ v4.3 live! Stagger=%ds  IDE: %s/editor", STARTUP_DELAY_SEC, RENDER_URL or "localhost:"+str(PORT))
 
