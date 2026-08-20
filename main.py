@@ -43,6 +43,7 @@ from telegram.ext import (
 )
 
 import editor as web_ide
+from premium_emoji import send_premium
 
 # ══════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -1674,7 +1675,12 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     name=update.effective_user.username or update.effective_user.first_name or ""
     save_username(uid,name); get_user(uid)
     if is_banned(uid): await update.message.reply_text("🚫 Banned."); return
-    await update.message.reply_text(home_text(uid),parse_mode="Markdown",reply_markup=reply_kb(is_admin(uid)))
+    # Animated premium-emoji welcome (auto-falls back to plain if unavailable)
+    await send_premium(ctx.bot, uid, [
+        ("em","gem")," ",("b","Codian Studio")," ",("em","rocket"),"\n",
+        "Welcome to your ",("b","bot hosting")," platform ",("em","fire"),
+    ], reply_markup=reply_kb(is_admin(uid)))
+    await update.message.reply_text(home_text(uid),parse_mode="Markdown")
     await update.message.reply_text("👇 Use the menu:",reply_markup=kb_home(is_admin(uid)))
 
 
