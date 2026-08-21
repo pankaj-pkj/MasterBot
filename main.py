@@ -44,7 +44,7 @@ from telegram.ext import (
 from telegram.error import BadRequest as _TgBadRequest
 
 import editor as web_ide
-from premium_emoji import send_premium
+import premium_emoji as pmx
 
 # ══════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -1781,12 +1781,8 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     name=update.effective_user.username or update.effective_user.first_name or ""
     save_username(uid,name); get_user(uid)
     if is_banned(uid): await update.message.reply_text("🚫 Banned."); return
-    # Animated premium-emoji welcome (auto-falls back to plain if unavailable)
-    await send_premium(ctx.bot, uid, [
-        ("em","gem")," ",("b","Codian Studio")," ",("em","rocket"),"\n",
-        "Welcome to your ",("b","bot hosting")," platform ",("em","fire"),
-    ], reply_markup=reply_kb(is_admin(uid)))
-    await update.message.reply_text(home_text(uid),parse_mode="Markdown")
+    # Premium emoji is applied automatically by SafeBot to every Markdown reply.
+    await update.message.reply_text(home_text(uid),parse_mode="Markdown",reply_markup=reply_kb(is_admin(uid)))
     await update.message.reply_text("👇 Use the menu:",reply_markup=kb_home(is_admin(uid)))
 
 
@@ -2455,39 +2451,75 @@ async def cmd_st(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 
+def _is_md(pm) -> bool:
+    return bool(pm) and str(pm).lower().startswith("markdown")
+
+
 class SafeBot(ExtBot):
     """
-    Bot that NEVER lets a message hard-fail on a Markdown parse error.
+    One central place that does two things for every outgoing message:
 
-    A username or bot name containing '_' / '*' can make Telegram reject the
-    whole message with 'can't parse entities' — which is why several
-    commands appeared broken. If that happens, resend the same message as
-    plain text (formatting is dropped, but the content always arrives).
+    1. PREMIUM EMOJI — when a Markdown message contains an emoji we have a
+       premium id for, convert it to Telegram HTML with <tg-emoji> so it
+       renders animated (owner has Premium → shown to everyone; normal emoji
+       is the built-in fallback). Messages without such emoji are left
+       untouched.
+    2. NEVER CRASH — if Telegram still rejects the parse (bad markup, odd
+       username), resend the same message as plain text. Content always
+       arrives; only styling is lost on that one message.
+
+    All reply_text / edit_message_text calls funnel through here, so this
+    covers the whole bot without touching 87 call sites.
     """
-    async def send_message(self, *a, **k):
+
+    def _prep(self, text):
+        """Return (new_text, parse_mode_override) or (text, None) to leave as-is."""
         try:
-            return await super().send_message(*a, **k)
+            if isinstance(text, str) and pmx.has_premium(text):
+                return pmx.md_to_html(text), "HTML"
+        except Exception:
+            pass
+        return text, None
+
+    async def _send(self, sup, a, k, tpos):
+        # locate the text argument (kwarg preferred, else positional tpos)
+        txt = None; via = None
+        if "text" in k: txt, via = k["text"], "k"
+        elif len(a) > tpos: txt, via = a[tpos], tpos
+        orig = txt
+        if _is_md(k.get("parse_mode")) and isinstance(txt, str):
+            new, pm = self._prep(txt)
+            if pm:
+                k = dict(k); k["parse_mode"] = pm
+                if via == "k": k["text"] = new
+                else: a = a[:tpos] + (new,) + a[tpos+1:]
+        try:
+            return await sup(*a, **k)
         except _TgBadRequest as e:
-            if k.get("parse_mode") and "parse" in str(e).lower():
+            if k.get("parse_mode") and "parse" in str(e).lower() and orig is not None:
                 k = dict(k); k["parse_mode"] = None
-                return await super().send_message(*a, **k)
+                plain = pmx.strip_md(orig)
+                if via == "k": k["text"] = plain
+                else: a = a[:tpos] + (plain,) + a[tpos+1:]
+                return await sup(*a, **k)
             raise
 
-    async def edit_message_text(self, *a, **k):
-        try:
-            return await super().edit_message_text(*a, **k)
-        except _TgBadRequest as e:
-            if k.get("parse_mode") and "parse" in str(e).lower():
-                k = dict(k); k["parse_mode"] = None
-                return await super().edit_message_text(*a, **k)
-            raise
+    async def send_message(self, *a, **k):        # send_message(chat_id, text, …)
+        return await self._send(super().send_message, a, k, 1)
 
-    async def send_document(self, *a, **k):
+    async def edit_message_text(self, *a, **k):   # edit_message_text(text, …)
+        return await self._send(super().edit_message_text, a, k, 0)
+
+    async def send_document(self, *a, **k):       # caption is always a kwarg
+        cap = k.get("caption")
+        if _is_md(k.get("parse_mode")) and isinstance(cap, str):
+            new, pm = self._prep(cap)
+            if pm: k = dict(k); k["parse_mode"] = pm; k["caption"] = new
         try:
             return await super().send_document(*a, **k)
         except _TgBadRequest as e:
-            if k.get("parse_mode") and "parse" in str(e).lower():
-                k = dict(k); k["parse_mode"] = None
+            if k.get("parse_mode") and "parse" in str(e).lower() and cap is not None:
+                k = dict(k); k["parse_mode"] = None; k["caption"] = pmx.strip_md(cap)
                 return await super().send_document(*a, **k)
             raise
 
@@ -2572,6 +2604,13 @@ async def main():
         MessageHandler(filters.SUCCESSFUL_PAYMENT,      payment_success),
     ]
     for h in handlers: _APP.add_handler(h)
+
+    async def on_error(update, context):
+        # Any unhandled exception is logged here instead of surfacing.
+        # PTB already isolates per-update, so one bad update never stops the
+        # bot — this just keeps the logs clean and actionable.
+        log.error("Handler error: %s", context.error, exc_info=context.error)
+    _APP.add_error_handler(on_error)
 
     web_ide._APP_REF = _APP
 

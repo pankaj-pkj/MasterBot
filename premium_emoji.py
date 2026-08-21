@@ -19,11 +19,101 @@
 ║  later — all at runtime, nothing to restart.                         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
-import time, logging
+import time, logging, re, html as _html
 from telegram import MessageEntity
 from telegram.error import BadRequest
 
 log = logging.getLogger("PremiumEmoji")
+
+# ── emoji char → premium (custom) emoji id ────────────────────────────
+# From the owner's committed id list. Any emoji the bot uses that is NOT
+# here simply stays a normal emoji (perfectly fine). Add more ids over time.
+CHAR2ID = {
+    "🪙":"5382164415019768638", "💰":"5417924076503062111",
+    "🔓":"5429405838345265327", "🏆":"5188344996356448758",
+    "📊":"5203993413346680064", "🚀":"5188481279963715781",
+    "💳":"5472250091332993630", "💎":"5462902520215002477",
+    "🎯":"5461009483314517035", "🔑":"5307843983102204243",
+    "🔋":"5307905813451397794", "⚡":"5373066076558996568",
+    "🔥":"5373310043586310463", "⭐":"5408977655330517200",
+    "👑":"5433758796289685818", "🎉":"5193018401810822951",
+    "🔗":"5440410042773824003", "📈":"5298614648138919107",
+    "💬":"5235570365094188078", "🛒":"5400090058030075645",
+    "📞":"5213179235996294999", "🧩":"5213306719215577669",
+    "🏦":"5238132025323444613", "📩":"5472239203590888751",
+}
+# Longest first so multi-codepoint emoji match before their parts.
+_EMOJI_RE = re.compile("|".join(re.escape(e) for e in
+                       sorted(CHAR2ID, key=len, reverse=True))) if CHAR2ID else None
+
+
+def has_premium(text: str) -> bool:
+    """True if the text contains at least one emoji we have a premium id for."""
+    return bool(_EMOJI_RE and _EMOJI_RE.search(text or ""))
+
+
+def _inject(escaped: str) -> str:
+    if not _EMOJI_RE:
+        return escaped
+    return _EMOJI_RE.sub(
+        lambda m: f'<tg-emoji emoji-id="{CHAR2ID[m.group(0)]}">{m.group(0)}</tg-emoji>',
+        escaped)
+
+
+def md_to_html(text: str) -> str:
+    """
+    Convert the small subset of legacy Markdown this bot uses into Telegram
+    HTML, injecting premium custom emoji (<tg-emoji>) into the visible text
+    (never inside code). HTML is actually more robust than legacy Markdown:
+    a lone '*' or '_' is just literal text, so messages that used to fail to
+    parse now render fine.
+    """
+    if not text:
+        return text
+    S = "\x00"
+    blocks, inls = [], []
+    # 1. stash fenced code ```...``` (optional language line)
+    def _sb(m): blocks.append(m.group(1)); return f"{S}B{len(blocks)-1}{S}"
+    t = re.sub(r"```(?:[a-zA-Z0-9_+-]*\n)?(.*?)```", _sb, text, flags=re.S)
+    # 2. stash inline code `...`
+    def _si(m): inls.append(m.group(1)); return f"{S}I{len(inls)-1}{S}"
+    t = re.sub(r"`([^`\n]+)`", _si, t)
+    # 3. escape everything else
+    t = _html.escape(t, quote=False)
+    # 4. *bold* (balanced, single line)
+    t = re.sub(r"\*([^*\n]+)\*", r"<b>\1</b>", t)
+    # 5. _italic_ only at word boundaries (won't touch name_with_underscores)
+    t = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", t)
+    # 6. [text](url)
+    t = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)",
+               r'<a href="\2">\1</a>', t)
+    # 7. premium emoji in the visible text
+    t = _inject(t)
+    # 8. restore code (escaped, no emoji injection)
+    t = re.sub(rf"{S}I(\d+){S}",
+               lambda m: f"<code>{_html.escape(inls[int(m.group(1))], quote=False)}</code>", t)
+    t = re.sub(rf"{S}B(\d+){S}",
+               lambda m: f"<pre>{_html.escape(blocks[int(m.group(1))], quote=False)}</pre>", t)
+    return t
+
+
+def strip_html(text: str) -> str:
+    """Last-resort plain text: remove tags, unescape entities."""
+    t = re.sub(r"<[^>]+>", "", text or "")
+    return _html.unescape(t)
+
+
+def strip_md(text: str) -> str:
+    """Plain text from legacy Markdown: drop *, _, ` markers, keep content
+    and emoji. Used for the ultimate no-parse-mode fallback."""
+    if not text:
+        return text
+    t = re.sub(r"```(?:[a-zA-Z0-9_+-]*\n)?(.*?)```", r"\1", text, flags=re.S)
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    t = re.sub(r"\*([^*\n]+)\*", r"\1", t)
+    t = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", t)
+    t = re.sub(r"\[([^\]\n]+)\]\([^)\s]+\)", r"\1", t)
+    return t
 
 # ── Logical name → (fallback emoji, custom_emoji_id) ──────────────────
 # Curated from the owner's "Premium id" list. The fallback char is what
