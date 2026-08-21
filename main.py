@@ -2260,6 +2260,96 @@ async def cmd_code(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
             document=_io.BytesIO(buf), filename=f"{display_name(bot_key)}.zip")
 
 
+# Patterns that suggest a hosted bot is reaching outside its own folder.
+# These are HEURISTICS meant to shortlist bots for a human to read — a hit
+# is "look at this", not proof of malice.
+_SUSPECT = [
+    (re.compile(r"hosted_bots"),                      "reads the hosting directory"),
+    (re.compile(r"/root(?![a-zA-Z])"),                "accesses /root"),
+    (re.compile(r"\.\./\.\."),                        "path traversal (../..)"),
+    (re.compile(r"\.env\b"),                          "touches .env files"),
+    (re.compile(r"/etc/(passwd|shadow)"),             "reads system accounts"),
+    (re.compile(r"glob\.glob|rglob|os\.walk"),        "scans the filesystem"),
+    (re.compile(r"user_tokens|registry\.json|usernames\.json"), "reads MasterBot data"),
+    (re.compile(r"\bcrontab\b|systemctl|/etc/systemd"), "touches system services"),
+    (re.compile(r"chmod\s*\(|chown\s*\(|setuid|/etc/sudoers"), "privilege changes"),
+    (re.compile(r"base64\.b64decode\s*\(\s*[\"'][A-Za-z0-9+/=]{80,}"), "large obfuscated blob"),
+    (re.compile(r"\beval\s*\(|\bexec\s*\("),          "runs generated code"),
+    (re.compile(r"authorized_keys|id_rsa|\.ssh/"),    "touches SSH keys"),
+]
+
+
+def _scan_bot_dir(bot_dir: Path) -> list[tuple[str, str, int]]:
+    """Return [(reason, file, line_no)] for suspicious lines in a bot."""
+    hits = []
+    try:
+        for f in bot_dir.rglob("*"):
+            if not f.is_file() or f.suffix.lower() not in (".py", ".sh", ".txt", ".env", ""):
+                continue
+            try:
+                if f.stat().st_size > 1_500_000:
+                    continue
+                text = f.read_text(errors="replace")
+            except OSError:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if len(line) > 400:
+                    continue
+                for pat, why in _SUSPECT:
+                    if pat.search(line):
+                        hits.append((why, f.relative_to(bot_dir).as_posix(), i))
+                        break
+            if len(hits) > 40:
+                break
+    except OSError:
+        pass
+    return hits
+
+
+async def cmd_scan(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Admin: /scan [bot] — find hosted bots reaching outside their folder."""
+    uid=update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    raw=" ".join(ctx.args).strip()
+    sm=await update.message.reply_text("🔎 Scanning bot code…")
+
+    if raw:
+        bot_key=_resolve_bot_key(uid,raw)
+        if not bot_key:
+            await sm.edit_text("❌ Bot not found."); return
+        targets=[bot_key]
+    else:
+        targets=[d.name for d in HOSTED_DIR.iterdir()
+                 if d.is_dir() and not d.name.startswith(("_","."))] if HOSTED_DIR.exists() else []
+
+    def _run():
+        out={}
+        for k in targets:
+            h=_scan_bot_dir(HOSTED_DIR/k)
+            if h: out[k]=h
+        return out
+    found = await asyncio.to_thread(_run)
+
+    if not found:
+        await sm.edit_text(f"✅ Scanned `{len(targets)}` bot(s).\n\n"
+                           f"Nothing reaching outside its own folder.",
+                           parse_mode="Markdown"); return
+
+    reg=load_registry()
+    lines=[f"🔎 *Scan: {len(found)} of {len(targets)} bot(s) flagged*\n",
+           "_Heuristic — read the code before acting._\n"]
+    for k,h in sorted(found.items(), key=lambda kv:-len(kv[1]))[:10]:
+        owner=reg.get(k,{}).get("owner_id","?")
+        reasons=sorted({r for r,_,_ in h})
+        lines.append(f"⚠️ *{dn(k)}*  👤`{owner}` {uname_tag(owner)}")
+        for r in reasons[:4]:
+            ex=next((f"{fn}:{ln}" for rr,fn,ln in h if rr==r), "")
+            lines.append(f"   • {mdq(r)} — `{mdq(ex)}`")
+        lines.append(f"   _/code {display_name(k)}_\n")
+    await sm.edit_text("\n".join(lines)[:4000],parse_mode="Markdown")
+
+
 async def cmd_audit(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     """Admin: /audit — security self-check of this server."""
     uid=update.effective_user.id
@@ -3127,6 +3217,7 @@ async def main():
         CommandHandler("code",        cmd_code),
         CommandHandler("whois",       cmd_whois),
         CommandHandler("audit",       cmd_audit),
+        CommandHandler("scan",        cmd_scan),
         CommandHandler("top",         cmd_top),
         CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
@@ -3197,6 +3288,7 @@ async def main():
             BotCommand("code",        "👑 Show a bot's code"),
             BotCommand("whois",       "👑 Bot's real @username"),
             BotCommand("audit",       "👑 Security audit"),
+            BotCommand("scan",        "👑 Scan bots for snooping"),
             BotCommand("top",         "👑 Top RAM/disk consumers"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
