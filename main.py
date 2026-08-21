@@ -39,8 +39,9 @@ from telegram import (
 )
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, MessageHandler, PreCheckoutQueryHandler, filters,
+    ContextTypes, MessageHandler, PreCheckoutQueryHandler, filters, ExtBot,
 )
+from telegram.error import BadRequest as _TgBadRequest
 
 import editor as web_ide
 from premium_emoji import send_premium
@@ -221,6 +222,16 @@ def display_name(bot_key: str) -> str:
     parts = bot_key.split("_", 1)
     if len(parts) == 2 and parts[0].isdigit(): return parts[1]
     return bot_key
+
+def mdq(s) -> str:
+    """Escape legacy-Markdown special chars in dynamic text (usernames, bot
+    names). A lone '_' or '*' otherwise makes Telegram reject the whole
+    message ('can't parse entities'), which is why some commands break."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(s))
+
+def dn(bot_key: str) -> str:
+    """Markdown-safe display name."""
+    return mdq(display_name(bot_key))
 
 def _resolve_bot_key(uid: int, name_or_key: str) -> str | None:
     reg = load_registry()
@@ -1631,7 +1642,9 @@ def kb_home(admin=False):
     return InlineKeyboardMarkup(rows)
 
 def kb_plans():
-    rows=[[ib(f"{p['label']} — {p['stars']} ⭐ ({p['desc']})","success",
+    # cheapest → most expensive: red → blue → green
+    _c={"starter":"danger","pro":"primary","elite":"success"}
+    rows=[[ib(f"{p['label']} — {p['stars']} ⭐ ({p['desc']})",_c.get(k,"primary"),
               callback_data=f"buy_{k}")] for k,p in PLANS.items()]
     rows.append([ib("🔙 Back",callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -1677,7 +1690,7 @@ def mybots_card(uid):
     reg=load_registry()
     lines=["🤖 *Your Hosted Bots*\n"]; rows=[]
     for bot_key in bots:
-        e=RUNNING_BOTS.get(bot_key,{}); dname=display_name(bot_key)
+        e=RUNNING_BOTS.get(bot_key,{}); dname=dn(bot_key)
         st=e.get("status","Offline 🔴"); up=fmt_up(time.time()-e["start_time"]) if e.get("start_time") else "—"
         rs=e.get("restarts",0); hl=e.get("heal_tries",0)
         node=reg.get(bot_key,{}).get("node","local")
@@ -1904,8 +1917,8 @@ async def cmd_all(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     for bot_key,e in RUNNING_BOTS.items():
         up=fmt_up(time.time()-e.get("start_time",time.time()))
         own=reg.get(bot_key,{}).get("owner_id","?")
-        un=USER_NAMES.get(str(own),"?"); rs=e.get("restarts",0)
-        lines.append(f"🔹 *{display_name(bot_key)}*\n   @{un}(`{own}`) {e.get('status','?')}\n   ⏱`{up}` 🔄`{rs}` {speed_lbl(e)}\n")
+        un=mdq(USER_NAMES.get(str(own),"?")); rs=e.get("restarts",0)
+        lines.append(f"🔹 *{dn(bot_key)}*\n   @{un}(`{own}`) {e.get('status','?')}\n   ⏱`{up}` 🔄`{rs}` {speed_lbl(e)}\n")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 
@@ -1917,7 +1930,7 @@ async def cmd_users(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     for k,v in list(users.items()):
         bots=sum(1 for bk,rv in reg.items() if str(rv.get("owner_id"))==k)
         run=sum(1 for bk,e in RUNNING_BOTS.items() if str(e.get("owner_id",""))==k and e.get("status")=="Running 🟢")
-        bn=" 🚫" if v.get("banned") else ""; uname=USER_NAMES.get(k,"?")
+        bn=" 🚫" if v.get("banned") else ""; uname=mdq(USER_NAMES.get(k,"?"))
         lines.append(f"• `{k}` @{uname}{bn}\n  📦`{bots}/{v.get('slots',0)}` 🟢`{run}` ⭐`{v.get('stars_spent',0)}`")
         if len(lines)>35: lines.append(f"_...and {total-35} more_"); break
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
@@ -1928,13 +1941,13 @@ async def cmd_user(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not is_admin(uid): return
     try: target=int(ctx.args[0])
     except: await update.message.reply_text("Usage: `/user <id>`",parse_mode="Markdown"); return
-    u=get_user(target); bots=get_user_bots(target); uname=USER_NAMES.get(str(target),"?")
+    u=get_user(target); bots=get_user_bots(target); uname=mdq(USER_NAMES.get(str(target),"?"))
     reg=load_registry()
     lines=[f"👤 *User: `{target}`*  @{uname}\n\n📦`{get_used_slots(target)}/{u['slots']}` 🚫`{u.get('banned',False)}`\n\n🤖 *Bots ({len(bots)}):*\n"]
     rows=[]
     for bot_key in bots:
         e=RUNNING_BOTS.get(bot_key,{}); node=reg.get(bot_key,{}).get("node","local")
-        lines.append(f"🔹 *{display_name(bot_key)}*  {e.get('status','Offline')}  [{node[:20]}]")
+        lines.append(f"🔹 *{dn(bot_key)}*  {e.get('status','Offline')}  [{node[:20]}]")
         rows.append([InlineKeyboardButton(f"⚙️ {display_name(bot_key)}",callback_data=f"detail|{bot_key}")])
     if not bots: lines.append("_No bots_")
     rows.append([InlineKeyboardButton("🔙 Back",callback_data="main_menu")])
@@ -2442,6 +2455,69 @@ async def cmd_st(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 
+class SafeBot(ExtBot):
+    """
+    Bot that NEVER lets a message hard-fail on a Markdown parse error.
+
+    A username or bot name containing '_' / '*' can make Telegram reject the
+    whole message with 'can't parse entities' — which is why several
+    commands appeared broken. If that happens, resend the same message as
+    plain text (formatting is dropped, but the content always arrives).
+    """
+    async def send_message(self, *a, **k):
+        try:
+            return await super().send_message(*a, **k)
+        except _TgBadRequest as e:
+            if k.get("parse_mode") and "parse" in str(e).lower():
+                k = dict(k); k["parse_mode"] = None
+                return await super().send_message(*a, **k)
+            raise
+
+    async def edit_message_text(self, *a, **k):
+        try:
+            return await super().edit_message_text(*a, **k)
+        except _TgBadRequest as e:
+            if k.get("parse_mode") and "parse" in str(e).lower():
+                k = dict(k); k["parse_mode"] = None
+                return await super().edit_message_text(*a, **k)
+            raise
+
+    async def send_document(self, *a, **k):
+        try:
+            return await super().send_document(*a, **k)
+        except _TgBadRequest as e:
+            if k.get("parse_mode") and "parse" in str(e).lower():
+                k = dict(k); k["parse_mode"] = None
+                return await super().send_document(*a, **k)
+            raise
+
+
+def _build_app():
+    """Build the Application with a SafeBot. Falls back to the plain builder
+    if anything about the custom-bot construction fails, so startup can
+    never be worse than before."""
+    try:
+        from telegram.request import HTTPXRequest
+        req  = HTTPXRequest(connection_pool_size=256, read_timeout=10,
+                            write_timeout=10, connect_timeout=10, pool_timeout=8)
+        greq = HTTPXRequest(connection_pool_size=256, read_timeout=42,
+                            write_timeout=15, connect_timeout=15, pool_timeout=5)
+        bot  = SafeBot(token=BOT_TOKEN, request=req, get_updates_request=greq)
+        app  = ApplicationBuilder().bot(bot).concurrent_updates(True).build()
+        log.info("SafeBot active — Markdown errors auto-fallback to plain text")
+        return app
+    except Exception as e:
+        log.warning("SafeBot build failed (%s) — using default bot", e)
+        return (
+            ApplicationBuilder().token(BOT_TOKEN)
+            .concurrent_updates(True).connection_pool_size(256)
+            .read_timeout(10).write_timeout(10).connect_timeout(10).pool_timeout(8)
+            .get_updates_read_timeout(42).get_updates_write_timeout(15)
+            .get_updates_connect_timeout(15).get_updates_pool_timeout(5)
+            .build()
+        )
+
+
 async def main():
     global _APP
     log.info("════════════════════════════════════════════════════")
@@ -2458,25 +2534,7 @@ async def main():
     # newly-created bot (not just flag a restart on an already-looping one).
     web_ide.init_editor(RUNNING_BOTS, None, ADMIN_IDS, run_bot)
 
-    _APP = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        # ── Speed & concurrency ───────────────────────────────────────
-        .concurrent_updates(True)          # handle multiple updates in parallel
-        # Big HTTP connection pool so replies actually go out in PARALLEL.
-        # With the default tiny pool, concurrent_updates still serialises on
-        # the connection — this is the real "instant reply under load" fix.
-        .connection_pool_size(256)
-        .read_timeout(10)                  # faster timeout (default 5)
-        .write_timeout(10)
-        .connect_timeout(10)
-        .pool_timeout(8)
-        .get_updates_read_timeout(42)      # long-poll: keep connection open
-        .get_updates_write_timeout(15)
-        .get_updates_connect_timeout(15)
-        .get_updates_pool_timeout(5)
-        .build()
-    )
+    _APP = _build_app()
 
     handlers = [
         CommandHandler("start",       cmd_start),
