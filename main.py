@@ -25,7 +25,7 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
-import os, re, ast, sys, json, time, shutil, logging, asyncio, subprocess, socket
+import os, re, ast, sys, json, time, shutil, signal, logging, asyncio, subprocess, socket
 from zipfile import ZipFile, BadZipFile
 from pathlib import Path
 
@@ -1479,15 +1479,34 @@ def smart_name(code,uid):
         raw=m.group(1).strip().lower()[:20].replace(" ","_") if m else f"{pf}_{int(time.time())%9999}"
     return make_bot_key(uid,raw)
 
+def _kill_tree(p):
+    """Kill a child bot AND everything it spawned.
+
+    Bots are started with start_new_session=True, so the whole family shares
+    a process group. Signalling the group means a bot that forks workers
+    can't leave orphans running (and eating RAM/disk) after a stop.
+    """
+    if not p or p.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    except Exception:
+        try: p.terminate()
+        except Exception: pass
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try: os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+
+
 def _do_stop(bot_key:str):
     e=RUNNING_BOTS.get(bot_key,{})
     if e:
         e["active"]=False
-        p=e.get("process")
-        if p and p.poll() is None:
-            p.terminate()
-            try: p.wait(timeout=5)
-            except subprocess.TimeoutExpired: p.kill()
+        _kill_tree(e.get("process"))
         e["status"]="Stopped 🛑"
 
 def _kill_remove(bot_key:str,deleted_by=0):
@@ -1611,9 +1630,16 @@ async def _run_bot_inner(bot_key: str, bot_dir: Path, owner_id: int):
             lf.write(f"\n{'─'*55}\n[START] {display_name(bot_key)}  ·  {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'─'*55}\n")
             lf.flush()
             child_env = _make_child_env(bot_dir)
-            proc=subprocess.Popen([sys.executable,"main.py"],
+            # stdin=DEVNULL: interactive bots (input() in a `while True`) would
+            # otherwise get instant EOF forever and spin, printing their prompt
+            # at full speed — one such bot wrote a 34GB log. With DEVNULL,
+            # input() raises EOFError and the bot exits instead of spinning.
+            # start_new_session: give each bot its own process group so we can
+            # kill the WHOLE tree (a bot that spawns children can't outlive us).
+            proc=subprocess.Popen([sys.executable,"-u","main.py"],
                                   cwd=str(bot_dir),stdout=lf,stderr=lf,
-                                  env=child_env)
+                                  stdin=subprocess.DEVNULL,
+                                  env=child_env, start_new_session=True)
         except Exception as exc:
             if lf:
                 try: lf.close()
@@ -1997,6 +2023,137 @@ async def cmd_all(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         un=uname_tag(own); rs=e.get("restarts",0)
         lines.append(f"🔹 *{dn(bot_key)}*\n   {un}(`{own}`) {e.get('status','?')}\n   ⏱`{up}` 🔄`{rs}` {speed_lbl(e)}\n")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+
+
+_TOKEN_RE = re.compile(r"\b(\d{8,12}:[A-Za-z0-9_-]{30,})\b")
+
+def _find_tokens(bot_dir: Path) -> list[str]:
+    """Find Telegram bot tokens inside a hosted bot's files (.env, .py, …)."""
+    found = []
+    try:
+        for f in bot_dir.rglob("*"):
+            if not f.is_file() or f.suffix.lower() in (".zip", ".png", ".jpg", ".db"):
+                continue
+            try:
+                if f.stat().st_size > 2_000_000: continue
+                for m in _TOKEN_RE.finditer(f.read_text(errors="replace")):
+                    if m.group(1) not in found: found.append(m.group(1))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
+
+
+async def _token_identity(token: str) -> str:
+    """Ask Telegram who a token belongs to → '@username (Name)'."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.telegram.org/bot{token}/getMe",
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                d = await r.json()
+        if d.get("ok"):
+            u = d["result"]
+            return f"@{u.get('username','?')} ({u.get('first_name','')})"
+        return f"invalid ({d.get('description','?')[:40]})"
+    except Exception as e:
+        return f"check failed ({str(e)[:30]})"
+
+
+async def cmd_code(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Admin: /code <bot> — inspect a hosted bot's files and identity."""
+    uid=update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    raw=" ".join(ctx.args).strip()
+    if not raw:
+        await update.message.reply_text(
+            "Usage: `/code <bot name or id>`\n\nSends the bot's files as a zip "
+            "plus its detected bot-token identity.",parse_mode="Markdown"); return
+    bot_key=_resolve_bot_key(uid,raw)
+    if not bot_key:
+        await update.message.reply_text("❌ Bot not found."); return
+    bot_dir=HOSTED_DIR/bot_key
+    if not bot_dir.exists():
+        await update.message.reply_text("❌ Files missing on disk."); return
+
+    sm=await update.message.reply_text("🔍 Inspecting…")
+    reg=load_registry(); owner=reg.get(bot_key,{}).get("owner_id","?")
+
+    def _scan():
+        files=[f for f in bot_dir.rglob("*") if f.is_file()]
+        total=sum(f.stat().st_size for f in files)/1024
+        names=sorted(f.relative_to(bot_dir).as_posix() for f in files)[:25]
+        return len(files),total,names
+    nfiles,kb,names = await asyncio.to_thread(_scan)
+
+    toks = await asyncio.to_thread(_find_tokens, bot_dir)
+    ident_lines=[]
+    for t in toks[:3]:
+        who = await _token_identity(t)
+        ident_lines.append(f"  • `{t[:10]}…` → *{mdq(who)}*")
+
+    e=RUNNING_BOTS.get(bot_key,{})
+    txt=(f"📦 *{dn(bot_key)}*\n\n"
+         f"👤 Owner: `{owner}` {uname_tag(owner)}\n"
+         f"📌 {e.get('status','Offline 🔴')}  ·  🔄`{e.get('restarts',0)}`\n"
+         f"🧠 RAM: `{(e.get('rss_mb') or 0):.0f}MB`\n"
+         f"📁 Files: `{nfiles}`  ·  `{kb:.0f}KB`\n\n"
+         f"🤖 *Bot identity (from token):*\n"
+         + ("\n".join(ident_lines) if ident_lines else "  _No bot token found in files_")
+         + "\n\n*Files:*\n```\n" + "\n".join(names[:25]) + "\n```")
+    await sm.edit_text(txt[:4000],parse_mode="Markdown")
+
+    buf=_zip_dir(bot_dir)
+    if buf:
+        import io as _io
+        await update.message.reply_document(
+            document=_io.BytesIO(buf), filename=f"{display_name(bot_key)}.zip",
+            caption=f"📦 Source of *{dn(bot_key)}*",parse_mode="Markdown")
+
+
+async def cmd_top(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Admin: /top — who is using the most RAM and disk right now."""
+    uid=update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    sm=await update.message.reply_text("📊 Measuring…")
+
+    def _disk():
+        out={}
+        if HOSTED_DIR.exists():
+            for d in HOSTED_DIR.iterdir():
+                if d.is_dir() and not d.name.startswith(("_",".")):
+                    out[d.name]=_dir_size_mb(d)
+        return out
+    disk = await asyncio.to_thread(_disk)
+
+    rows=[]
+    for k,e in RUNNING_BOTS.items():
+        rows.append((k, e.get("owner_id",0), e.get("rss_mb") or 0.0,
+                     disk.get(k,0.0), e.get("restarts",0)))
+    for k,mb in disk.items():
+        if k not in RUNNING_BOTS:
+            reg=load_registry()
+            rows.append((k, reg.get(k,{}).get("owner_id",0), 0.0, mb, 0))
+    rows.sort(key=lambda r:-(r[2]+r[3]))
+
+    lines=["📊 *Top consumers*\n"]
+    for k,own,ram,dsk,rs in rows[:12]:
+        warn=" ⚠️" if rs>20 or dsk>50 else ""
+        lines.append(f"🔹 *{dn(k)}*{warn}\n   👤`{own}` {uname_tag(own)}\n"
+                     f"   🧠`{ram:.0f}MB`  💾`{dsk:.0f}MB`  🔄`{rs}`")
+    if not rows: lines.append("_No bots._")
+
+    per={}
+    for k,own,ram,dsk,rs in rows:
+        a=per.setdefault(str(own),[0.0,0.0]); a[0]+=ram; a[1]+=dsk
+    if per:
+        lines.append("\n👥 *Per user:*")
+        for u_,(ram,dsk) in sorted(per.items(),key=lambda kv:-(kv[1][0]+kv[1][1]))[:8]:
+            q=get_user_ram_quota(int(u_)) if u_.isdigit() else FREE_RAM_MB
+            lines.append(f"  `{u_}` {uname_tag(u_)}— 🧠`{ram:.0f}/{q}MB`  💾`{dsk:.0f}MB`")
+    await sm.edit_text("\n".join(lines)[:4000],parse_mode="Markdown")
 
 
 async def cmd_users(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -2674,6 +2831,8 @@ async def main():
         CommandHandler("ram",         cmd_ram),
         CommandHandler("disk",        cmd_disk),
         CommandHandler("server",      cmd_server),
+        CommandHandler("code",        cmd_code),
+        CommandHandler("top",         cmd_top),
         CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
         CommandHandler("addnode",     cmd_addnode),
@@ -2740,6 +2899,8 @@ async def main():
             BotCommand("ram",         "👑 Memory usage"),
             BotCommand("disk",        "👑 Disk usage"),
             BotCommand("server",      "👑 Full server status"),
+            BotCommand("code",        "👑 Inspect a bot's code"),
+            BotCommand("top",         "👑 Top RAM/disk consumers"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
             BotCommand("msg",         "👑 Broadcast"),
