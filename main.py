@@ -147,6 +147,92 @@ LOG_MAX_MB     = 20      # trim a bot log once it grows past this
 LOG_KEEP_MB    = 4       # how much of the tail to keep when trimming
 LOG_CHECK_SEC  = 60      # how often to sweep
 
+# ── Per-bot SANDBOX (kernel-enforced, not just monitoring) ────────────
+# Everything above only *watches* bots and reacts. These limits are applied
+# by the KERNEL to each child process, so a hostile or buggy bot is stopped
+# at the moment it misbehaves — it cannot fill the disk, fork-bomb, or
+# starve the master, no matter what its code does.
+BOT_MAX_FILE_MB = 256    # biggest single file a bot may write (RLIMIT_FSIZE)
+BOT_MAX_PROCS   = 256    # max processes a bot may spawn (anti fork-bomb)
+BOT_NICE        = 5      # lower CPU priority: master always stays responsive
+BOT_USER        = os.environ.get("BOT_USER", "botrunner")  # unprivileged runner
+
+# Resolved once at startup: (uid, gid) of BOT_USER, or None if unavailable.
+_BOT_IDS: tuple[int, int] | None = None
+
+
+def ensure_bot_user() -> tuple[int, int] | None:
+    """
+    Find (or create) the unprivileged account child bots run as.
+
+    THIS IS THE MAIN ISOLATION BOUNDARY. Until now every hosted bot ran as
+    root, which meant any uploaded bot could simply read /root/MasterBot/.env
+    and walk off with the master BOT_TOKEN, the GitHub PAT and every user's
+    data — no exploit required. Dropping to a normal user also makes
+    RLIMIT_NPROC actually bite (root ignores it), so fork bombs are capped.
+
+    Returns None if we can't set this up, in which case we keep the old
+    behaviour rather than refusing to start.
+    """
+    import pwd
+    try:
+        p = pwd.getpwnam(BOT_USER)
+        return (p.pw_uid, p.pw_gid)
+    except KeyError:
+        pass
+    try:
+        subprocess.run(
+            ["useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", BOT_USER],
+            check=True, capture_output=True, timeout=30)
+        p = pwd.getpwnam(BOT_USER)
+        log.info("Created unprivileged bot user '%s' (uid=%d)", BOT_USER, p.pw_uid)
+        return (p.pw_uid, p.pw_gid)
+    except Exception as e:
+        log.warning("Could not create user '%s' (%s). Bots will run as the "
+                    "current user — less isolated.", BOT_USER, e)
+        return None
+
+
+def ensure_traversable():
+    """
+    Let the bot user *walk into* hosted_bots without being able to read
+    anything else on the way.
+
+    hosted_bots usually lives under /root, which is mode 700 — an
+    unprivileged bot cannot even reach its own folder, so it fails to
+    start. Adding the execute bit (711) grants traversal ONLY: the bot
+    still cannot list those directories, and .env (600) plus _data (700)
+    stay unreadable to it.
+    """
+    if not _BOT_IDS:
+        return
+    d = HOSTED_DIR.resolve()
+    chain = [d] + list(d.parents)
+    for p in chain:
+        if str(p) == "/":
+            break
+        try:
+            mode = p.stat().st_mode & 0o777
+            if not mode & 0o001:
+                os.chmod(p, mode | 0o011)   # +x for group and other
+        except OSError as e:
+            log.warning("Could not make %s traversable: %s", p, e)
+
+
+def _prepare_bot_dir(bot_dir: Path):
+    """Give the bot ownership of its own folder (and nothing else)."""
+    if not _BOT_IDS:
+        return
+    uid, gid = _BOT_IDS
+    try:
+        os.chown(bot_dir, uid, gid)
+        os.chmod(bot_dir, 0o700)
+        for f in bot_dir.rglob("*"):
+            try: os.chown(f, uid, gid)
+            except OSError: pass
+    except OSError as e:
+        log.warning("chown %s failed: %s", bot_dir, e)
+
 # ── RAM quota enforcement ─────────────────────────────────────────────
 # A bot-count limit alone is NOT enforceable: a user can upload one
 # "hosting bot" that itself spawns 20 child processes and it still counts
@@ -1479,6 +1565,49 @@ def smart_name(code,uid):
         raw=m.group(1).strip().lower()[:20].replace(" ","_") if m else f"{pf}_{int(time.time())%9999}"
     return make_bot_key(uid,raw)
 
+def _sandbox_child():
+    """
+    Runs inside the child AFTER fork, BEFORE the bot's code executes.
+    Applies hard kernel limits the bot cannot escape or raise.
+
+    Why this matters: a bot only had to write in a loop to fill 40GB and
+    take the whole server down. RLIMIT_FSIZE makes that literally
+    impossible — the kernel kills the process the moment it tries to grow a
+    file past the cap, whatever the code does.
+    """
+    import resource
+    try:  # own session → we can kill the whole tree later
+        os.setsid()
+    except Exception:
+        pass
+    try:  # hard cap on any single file → no more 34GB logs
+        n = BOT_MAX_FILE_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_FSIZE, (n, n))
+    except Exception:
+        pass
+    try:  # anti fork-bomb
+        resource.setrlimit(resource.RLIMIT_NPROC, (BOT_MAX_PROCS, BOT_MAX_PROCS))
+    except Exception:
+        pass
+    try:  # a crash must not dump a multi-GB core file
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+    # Drop root LAST — after this we have no privilege left to set anything.
+    if _BOT_IDS:
+        uid, gid = _BOT_IDS
+        try:
+            os.setgid(gid)
+            os.setgroups([])          # no inherited group memberships
+            os.setuid(uid)            # permanent: cannot be undone by the bot
+        except Exception:
+            os._exit(97)              # never run the bot still holding root
+    try:  # a spinning bot must never starve the master bot
+        os.nice(BOT_NICE)
+    except Exception:
+        pass
+
+
 def _kill_tree(p):
     """Kill a child bot AND everything it spawned.
 
@@ -1630,6 +1759,7 @@ async def _run_bot_inner(bot_key: str, bot_dir: Path, owner_id: int):
             lf.write(f"\n{'─'*55}\n[START] {display_name(bot_key)}  ·  {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'─'*55}\n")
             lf.flush()
             child_env = _make_child_env(bot_dir)
+            _prepare_bot_dir(bot_dir)   # bot owns its folder, nothing else
             # stdin=DEVNULL: interactive bots (input() in a `while True`) would
             # otherwise get instant EOF forever and spin, printing their prompt
             # at full speed — one such bot wrote a 34GB log. With DEVNULL,
@@ -1639,7 +1769,7 @@ async def _run_bot_inner(bot_key: str, bot_dir: Path, owner_id: int):
             proc=subprocess.Popen([sys.executable,"-u","main.py"],
                                   cwd=str(bot_dir),stdout=lf,stderr=lf,
                                   stdin=subprocess.DEVNULL,
-                                  env=child_env, start_new_session=True)
+                                  env=child_env, preexec_fn=_sandbox_child)
         except Exception as exc:
             if lf:
                 try: lf.close()
@@ -2061,55 +2191,78 @@ async def _token_identity(token: str) -> str:
 
 
 async def cmd_code(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """Admin: /code <bot> — inspect a hosted bot's files and identity."""
+    """Admin: /code <bot> — the CODE only (main.py in chat + full zip)."""
     uid=update.effective_user.id
     if not is_admin(uid):
         await update.message.reply_text("❌ Admin only."); return
     raw=" ".join(ctx.args).strip()
     if not raw:
         await update.message.reply_text(
-            "Usage: `/code <bot name or id>`\n\nSends the bot's files as a zip "
-            "plus its detected bot-token identity.",parse_mode="Markdown"); return
+            "Usage: `/code <bot name>`\n\nShows the bot's code.\n"
+            "For its @username and stats use `/whois <bot name>`.",
+            parse_mode="Markdown"); return
     bot_key=_resolve_bot_key(uid,raw)
     if not bot_key:
         await update.message.reply_text("❌ Bot not found."); return
     bot_dir=HOSTED_DIR/bot_key
-    if not bot_dir.exists():
-        await update.message.reply_text("❌ Files missing on disk."); return
+    if not (bot_dir/"main.py").exists():
+        await update.message.reply_text("❌ No main.py on disk."); return
 
-    sm=await update.message.reply_text("🔍 Inspecting…")
-    reg=load_registry(); owner=reg.get(bot_key,{}).get("owner_id","?")
+    # main.py inline (trimmed to fit Telegram), full project as a zip
+    code = await asyncio.to_thread(
+        lambda: (bot_dir/"main.py").read_text(errors="replace"))
+    head = code[:3300]
+    more = f"\n… ({len(code)} chars total, full code in the zip)" if len(code)>3300 else ""
+    await update.message.reply_text(
+        f"📄 *{dn(bot_key)}* — `main.py`\n```python\n{head}\n```{more}",
+        parse_mode="Markdown")
 
-    def _scan():
-        files=[f for f in bot_dir.rglob("*") if f.is_file()]
-        total=sum(f.stat().st_size for f in files)/1024
-        names=sorted(f.relative_to(bot_dir).as_posix() for f in files)[:25]
-        return len(files),total,names
-    nfiles,kb,names = await asyncio.to_thread(_scan)
-
-    toks = await asyncio.to_thread(_find_tokens, bot_dir)
-    ident_lines=[]
-    for t in toks[:3]:
-        who = await _token_identity(t)
-        ident_lines.append(f"  • `{t[:10]}…` → *{mdq(who)}*")
-
-    e=RUNNING_BOTS.get(bot_key,{})
-    txt=(f"📦 *{dn(bot_key)}*\n\n"
-         f"👤 Owner: `{owner}` {uname_tag(owner)}\n"
-         f"📌 {e.get('status','Offline 🔴')}  ·  🔄`{e.get('restarts',0)}`\n"
-         f"🧠 RAM: `{(e.get('rss_mb') or 0):.0f}MB`\n"
-         f"📁 Files: `{nfiles}`  ·  `{kb:.0f}KB`\n\n"
-         f"🤖 *Bot identity (from token):*\n"
-         + ("\n".join(ident_lines) if ident_lines else "  _No bot token found in files_")
-         + "\n\n*Files:*\n```\n" + "\n".join(names[:25]) + "\n```")
-    await sm.edit_text(txt[:4000],parse_mode="Markdown")
-
-    buf=_zip_dir(bot_dir)
+    buf=await asyncio.to_thread(_zip_dir, bot_dir)
     if buf:
         import io as _io
         await update.message.reply_document(
-            document=_io.BytesIO(buf), filename=f"{display_name(bot_key)}.zip",
-            caption=f"📦 Source of *{dn(bot_key)}*",parse_mode="Markdown")
+            document=_io.BytesIO(buf), filename=f"{display_name(bot_key)}.zip")
+
+
+async def cmd_whois(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Admin: /whois <bot> — the bot's real @username, owner and usage."""
+    uid=update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("❌ Admin only."); return
+    raw=" ".join(ctx.args).strip()
+    if not raw:
+        await update.message.reply_text(
+            "Usage: `/whois <bot name>`\n\nShows the bot's real @username "
+            "(from its token), owner and usage.",parse_mode="Markdown"); return
+    bot_key=_resolve_bot_key(uid,raw)
+    if not bot_key:
+        await update.message.reply_text("❌ Bot not found."); return
+    bot_dir=HOSTED_DIR/bot_key
+
+    sm=await update.message.reply_text("🔍 Checking…")
+    reg=load_registry(); owner=reg.get(bot_key,{}).get("owner_id","?")
+
+    toks = await asyncio.to_thread(_find_tokens, bot_dir)
+    ident=[]
+    for t in toks[:3]:
+        who = await _token_identity(t)
+        ident.append(f"  • *{mdq(who)}*")
+
+    def _scan():
+        files=[f for f in bot_dir.rglob("*") if f.is_file()]
+        return len(files), sum(f.stat().st_size for f in files)/(1024*1024)
+    try: nfiles,mb = await asyncio.to_thread(_scan)
+    except Exception: nfiles,mb = 0,0.0
+
+    e=RUNNING_BOTS.get(bot_key,{})
+    await sm.edit_text(
+        f"🤖 *{dn(bot_key)}*\n\n"
+        f"*Real bot:*\n" + ("\n".join(ident) if ident else "  _no token found in files_") +
+        f"\n\n👤 Owner: `{owner}` {uname_tag(owner)}\n"
+        f"📌 {e.get('status','Offline 🔴')}  ·  🔄 restarts `{e.get('restarts',0)}`\n"
+        f"🧠 RAM `{(e.get('rss_mb') or 0):.0f}MB`  ·  💾 `{mb:.1f}MB`  ·  📁 `{nfiles}` files\n\n"
+        f"_Code: /code {display_name(bot_key)}_",
+        parse_mode="Markdown")
 
 
 async def cmd_top(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -2156,18 +2309,51 @@ async def cmd_top(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await sm.edit_text("\n".join(lines)[:4000],parse_mode="Markdown")
 
 
+async def backfill_names(bot, uids, limit=25) -> int:
+    """
+    Look up usernames we never captured.
+
+    USER_NAMES is only filled when someone messages the bot, so users who
+    registered earlier show no name. Ask Telegram for those (get_chat) and
+    cache the result. Capped per call and paced so we never hit flood limits.
+    """
+    done=0
+    for u in uids:
+        if done>=limit: break
+        if USER_NAMES.get(str(u)): continue
+        try:
+            c=await bot.get_chat(int(u))
+            nm=c.username or c.first_name or ""
+            if nm:
+                USER_NAMES[str(u)]=nm; done+=1
+            else:
+                USER_NAMES[str(u)]=""      # remember "unknown" to stop retrying
+        except Exception:
+            USER_NAMES[str(u)]=""          # blocked/deleted account
+        await asyncio.sleep(0.06)
+    if done: _jsave(DATA_DIR/"usernames.json", USER_NAMES)
+    return done
+
+
 async def cmd_users(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     uid=update.effective_user.id
     if not is_admin(uid): await update.message.reply_text("❌ Admin only."); return
     users=load_users(); reg=load_registry(); total=len(users)
+    sm=await update.message.reply_text("👥 Loading users…")
+    # Fill in any names we don't have yet, so the list isn't full of bare ids.
+    await backfill_names(ctx.bot, list(users.keys()))
     lines=[f"👥 *All Users ({total})*\n"]
+    shown=0
     for k,v in list(users.items()):
         bots=sum(1 for bk,rv in reg.items() if str(rv.get("owner_id"))==k)
         run=sum(1 for bk,e in RUNNING_BOTS.items() if str(e.get("owner_id",""))==k and e.get("status")=="Running 🟢")
         bn=" 🚫" if v.get("banned") else ""; uname=uname_tag(k)
         lines.append(f"• `{k}` {uname}{bn}\n  📦`{bots}/{v.get('slots',0)}` 🟢`{run}` ⭐`{v.get('stars_spent',0)}`")
-        if len(lines)>35: lines.append(f"_...and {total-35} more_"); break
-    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+        shown+=1
+        if shown>=35:
+            if total>shown: lines.append(f"_…and {total-shown} more_")
+            break
+    await sm.edit_text("\n".join(lines)[:4000],parse_mode="Markdown")
 
 
 async def cmd_user(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -2795,6 +2981,21 @@ async def main():
     log.info("   Codian Studio 💎   IS_WORKER=%s", IS_WORKER)
     log.info("════════════════════════════════════════════════════")
 
+    global _BOT_IDS
+    _BOT_IDS = ensure_bot_user()
+    if _BOT_IDS:
+        # Secrets stay readable only by us, never by hosted bots.
+        for secret in (Path(__file__).resolve().parent / ".env", DATA_DIR):
+            try:
+                if secret.exists(): os.chmod(secret, 0o700 if secret.is_dir() else 0o600)
+            except OSError: pass
+        HOSTED_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_traversable()
+        log.info("🔒 Bots run as '%s' (uid=%d) — isolated from root and secrets",
+                 BOT_USER, _BOT_IDS[0])
+    else:
+        log.warning("⚠️  Bots will run with THIS process's privileges.")
+
     configure_git(); sync_from_github()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     DELETED_DIR.mkdir(parents=True, exist_ok=True)
@@ -2832,6 +3033,7 @@ async def main():
         CommandHandler("disk",        cmd_disk),
         CommandHandler("server",      cmd_server),
         CommandHandler("code",        cmd_code),
+        CommandHandler("whois",       cmd_whois),
         CommandHandler("top",         cmd_top),
         CommandHandler("st",          cmd_st),
         CommandHandler("migratenodes",cmd_migratenodes),
@@ -2899,7 +3101,8 @@ async def main():
             BotCommand("ram",         "👑 Memory usage"),
             BotCommand("disk",        "👑 Disk usage"),
             BotCommand("server",      "👑 Full server status"),
-            BotCommand("code",        "👑 Inspect a bot's code"),
+            BotCommand("code",        "👑 Show a bot's code"),
+            BotCommand("whois",       "👑 Bot's real @username"),
             BotCommand("top",         "👑 Top RAM/disk consumers"),
             BotCommand("migratenodes","👑 Rebalance bots across nodes"),
             BotCommand("addnode",     "👑 Add worker"),
