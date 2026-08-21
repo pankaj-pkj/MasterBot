@@ -137,6 +137,16 @@ FAST_CRASH_SEC    = 30
 MAX_HEAL_TRIES    = 2
 STARTUP_DELAY_SEC = 5    # staggered startup: wait N seconds between each bot
 
+# ── Log size caps ─────────────────────────────────────────────────────
+# A crash-looping child bot can print without limit. One did exactly that
+# and wrote a 34GB bot_output.log, filling the whole disk (and because the
+# file was deleted while still open, the space was not even reclaimed).
+# The janitor below keeps every bot log bounded, in place, so this cannot
+# take the server down again.
+LOG_MAX_MB     = 20      # trim a bot log once it grows past this
+LOG_KEEP_MB    = 4       # how much of the tail to keep when trimming
+LOG_CHECK_SEC  = 60      # how often to sweep
+
 # ── RAM quota enforcement ─────────────────────────────────────────────
 # A bot-count limit alone is NOT enforceable: a user can upload one
 # "hosting bot" that itself spawns 20 child processes and it still counts
@@ -1015,6 +1025,63 @@ async def offload_bots_for_memory(pct: float) -> int:
     if moved:
         push_to_github("RAM auto-offload")
     return moved
+
+
+def _trim_log(path: Path) -> float:
+    """
+    Trim an oversized log IN PLACE, keeping the last LOG_KEEP_MB.
+
+    In place matters: the child process holds this file open, so deleting or
+    replacing it would NOT free the space (the kernel keeps the inode alive
+    until the writer exits — exactly how 34GB stayed lost). Truncating the
+    same inode frees it immediately, and the bot keeps logging happily.
+    Returns MB freed.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0.0
+    if size <= LOG_MAX_MB * 1024 * 1024:
+        return 0.0
+    keep = LOG_KEEP_MB * 1024 * 1024
+    try:
+        with open(path, "r+b") as f:
+            f.seek(max(0, size - keep))
+            tail = f.read()
+            f.seek(0)
+            f.write(b"[log trimmed - previous output discarded to save disk]\n")
+            f.write(tail)
+            f.truncate()
+        freed = (size - path.stat().st_size) / (1024 * 1024)
+        log.warning("Trimmed %s: freed %.0f MB", path.parent.name, freed)
+        return freed
+    except OSError as e:
+        log.warning("Could not trim %s: %s", path, e)
+        return 0.0
+
+
+def _sweep_logs() -> float:
+    total = 0.0
+    if not HOSTED_DIR.exists():
+        return 0.0
+    try:
+        for d in HOSTED_DIR.iterdir():
+            if d.is_dir() and not d.name.startswith(("_", ".")):
+                total += _trim_log(d / "bot_output.log")
+    except OSError:
+        pass
+    return total
+
+
+async def log_janitor_loop():
+    """Keep child-bot logs bounded so a runaway bot can't fill the disk."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.to_thread(_sweep_logs)
+        except Exception as e:
+            log.warning("Log janitor error: %s", e)
+        await asyncio.sleep(LOG_CHECK_SEC)
 
 
 async def ram_quota_loop():
@@ -2633,6 +2700,9 @@ async def main():
     asyncio.create_task(node_health_monitor())   # auto-failover
     asyncio.create_task(memory_guard_loop())     # RAM-based auto-offload
     asyncio.create_task(ram_quota_loop())        # per-user RAM quota enforcement
+    asyncio.create_task(log_janitor_loop())      # cap child-bot logs (disk guard)
+    freed = await asyncio.to_thread(_sweep_logs)  # trim anything oversized now
+    if freed: log.info("Startup log sweep freed %.0f MB", freed)
     if AUTOSTART:
         await autostart()   # staggered (opt-in via AUTOSTART=true)
     else:
