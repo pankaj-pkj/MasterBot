@@ -87,7 +87,11 @@ def md_to_html(text: str) -> str:
     # 6. [text](url)
     t = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+|tg://[^)\s]+)\)",
                r'<a href="\2">\1</a>', t)
-    # 7. premium emoji in the visible text
+    # 7. drop Markdown backslash-escapes. Callers escape '_'/'*' for legacy
+    #    Markdown (e.g. "codian\_studio"); in HTML those chars are literal, so
+    #    the backslash must go or it shows up in the message.
+    t = re.sub(r"\\([_*`\[\]()~>#+=|{}.!-])", r"\1", t)
+    # 8. premium emoji in the visible text
     t = _inject(t)
     # 8. restore code (escaped, no emoji injection)
     t = re.sub(rf"{S}I(\d+){S}",
@@ -113,6 +117,7 @@ def strip_md(text: str) -> str:
     t = re.sub(r"\*([^*\n]+)\*", r"\1", t)
     t = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"\1", t)
     t = re.sub(r"\[([^\]\n]+)\]\([^)\s]+\)", r"\1", t)
+    t = re.sub(r"\\([_*`\[\]()~>#+=|{}.!-])", r"\1", t)   # drop md escapes
     return t
 
 # ── Logical name → (fallback emoji, custom_emoji_id) ──────────────────

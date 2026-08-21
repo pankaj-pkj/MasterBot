@@ -233,6 +233,11 @@ def dn(bot_key: str) -> str:
     """Markdown-safe display name."""
     return mdq(display_name(bot_key))
 
+def uname_tag(uid) -> str:
+    """'@name' when we know the username, else '' (never a bare '@?')."""
+    n = USER_NAMES.get(str(uid), "")
+    return f"@{mdq(n)} " if n else ""
+
 def _resolve_bot_key(uid: int, name_or_key: str) -> str | None:
     reg = load_registry()
     if name_or_key in reg:
@@ -552,8 +557,17 @@ def _jload(p: Path, d):
     except: return d
 
 def _jsave(p: Path, data):
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    """
+    Save JSON. NEVER raises: a full disk used to bubble an OSError out of
+    save_username() at the top of the text handler, killing the whole
+    command (buttons silently stopped responding). Failing to persist is
+    bad, but taking the bot down with it is worse — log and continue.
+    """
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log.error("Could not write %s: %s (disk full? check /disk)", p, e)
 
 # ── mtime-cached loaders ──────────────────────────────────────────────
 # These files are read on almost every Telegram update. Re-reading +
@@ -1913,8 +1927,8 @@ async def cmd_all(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     for bot_key,e in RUNNING_BOTS.items():
         up=fmt_up(time.time()-e.get("start_time",time.time()))
         own=reg.get(bot_key,{}).get("owner_id","?")
-        un=mdq(USER_NAMES.get(str(own),"?")); rs=e.get("restarts",0)
-        lines.append(f"🔹 *{dn(bot_key)}*\n   @{un}(`{own}`) {e.get('status','?')}\n   ⏱`{up}` 🔄`{rs}` {speed_lbl(e)}\n")
+        un=uname_tag(own); rs=e.get("restarts",0)
+        lines.append(f"🔹 *{dn(bot_key)}*\n   {un}(`{own}`) {e.get('status','?')}\n   ⏱`{up}` 🔄`{rs}` {speed_lbl(e)}\n")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 
@@ -1926,8 +1940,8 @@ async def cmd_users(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     for k,v in list(users.items()):
         bots=sum(1 for bk,rv in reg.items() if str(rv.get("owner_id"))==k)
         run=sum(1 for bk,e in RUNNING_BOTS.items() if str(e.get("owner_id",""))==k and e.get("status")=="Running 🟢")
-        bn=" 🚫" if v.get("banned") else ""; uname=mdq(USER_NAMES.get(k,"?"))
-        lines.append(f"• `{k}` @{uname}{bn}\n  📦`{bots}/{v.get('slots',0)}` 🟢`{run}` ⭐`{v.get('stars_spent',0)}`")
+        bn=" 🚫" if v.get("banned") else ""; uname=uname_tag(k)
+        lines.append(f"• `{k}` {uname}{bn}\n  📦`{bots}/{v.get('slots',0)}` 🟢`{run}` ⭐`{v.get('stars_spent',0)}`")
         if len(lines)>35: lines.append(f"_...and {total-35} more_"); break
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
@@ -1937,9 +1951,9 @@ async def cmd_user(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not is_admin(uid): return
     try: target=int(ctx.args[0])
     except: await update.message.reply_text("Usage: `/user <id>`",parse_mode="Markdown"); return
-    u=get_user(target); bots=get_user_bots(target); uname=mdq(USER_NAMES.get(str(target),"?"))
+    u=get_user(target); bots=get_user_bots(target); uname=uname_tag(target)
     reg=load_registry()
-    lines=[f"👤 *User: `{target}`*  @{uname}\n\n📦`{get_used_slots(target)}/{u['slots']}` 🚫`{u.get('banned',False)}`\n\n🤖 *Bots ({len(bots)}):*\n"]
+    lines=[f"👤 *User: `{target}`*  {uname}\n\n📦`{get_used_slots(target)}/{u['slots']}` 🚫`{u.get('banned',False)}`\n\n🤖 *Bots ({len(bots)}):*\n"]
     rows=[]
     for bot_key in bots:
         e=RUNNING_BOTS.get(bot_key,{}); node=reg.get(bot_key,{}).get("node","local")
